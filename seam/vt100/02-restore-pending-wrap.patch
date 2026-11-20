@@ -11,8 +11,8 @@ What:   restoring the cursor (DECRC, ESC 8) keeps a pending wrap. restore_cursor
 Where:  src/grid.rs (restore_cursor), tests/escape.rs (two tests).
 Shape:  fixes behaviour.
 Needs:  01-last-n-rows.patch before it (cut against its result; they share no lines).
-Status: offered upstream on branch wmacevoy/shpool_vt100:fix/restore-cursor-pending-wrap
-        (PR to shell-pool/shpool_vt100 not yet opened).
+Status: offered upstream as https://github.com/shell-pool/shpool_vt100/pull/3. Drop this patch
+        once shpool uses a release that includes it.
 
 diff --git a/src/grid.rs b/src/grid.rs
 index 0582bd0..6bd810a 100644
