@@ -12,6 +12,7 @@ seam: every patch here is also offered to shpool, and goes once a shpool release
 | Patch | Upstream |
 | --- | --- |
 | `01-rename.patch` | [shell-pool/shpool#459](https://github.com/shell-pool/shpool/pull/459) |
+| `02-macos-tests.patch` | not yet offered (tests only: find zsh/fish, unskip the motd pager tests) |
 
 To change one: edit the copy in `.build/core`, see it build and `tools/check.sh` pass, and cut
 the patch again from the difference (`git diff` in a checkout of `core/` with the earlier patches

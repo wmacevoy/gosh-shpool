@@ -1,0 +1,228 @@
+Copyright 2026 Warren D. MacEvoy. Apache-2.0. See LICENSE.
+
+What:   lets shpool's own tests run on macOS where they were skipped for reasons of the tests,
+        not of shpool. The zsh and fish tests named /usr/bin/zsh and /usr/bin/fish (macOS has
+        /bin/zsh, and homebrew's fish is elsewhere); they now find the shell on $PATH and in the
+        usual places (support::find_shell, support::shell_config), and say so if it is not
+        installed. The four motd pager tests, skipped for a "pager pty output issue", pass on
+        macOS now and are no longer skipped.
+Where:  shpool/tests only: attach.rs, support/mod.rs, and the three configs that named a shell
+        path, which become templates (data/*.toml -> data/*.toml.tmpl).
+Shape:  tests only; shpool itself is unchanged.
+Needs:  01-rename.patch before it (cut against its result).
+Status: to be offered upstream (shell-pool/shpool).
+
+diff --git a/shpool/tests/attach.rs b/shpool/tests/attach.rs
+index fbe18beb..7722493a 100644
+--- a/shpool/tests/attach.rs
++++ b/shpool/tests/attach.rs
+diff --git a/shpool/tests/attach.rs b/shpool/tests/attach.rs
+index fbe18beb..7722493a 100644
+--- a/shpool/tests/attach.rs
++++ b/shpool/tests/attach.rs
+@@ -399,9 +399,10 @@ fn forward_env_live_reload_bash() -> anyhow::Result<()> {
+ 
+ #[test]
+ #[timeout(30000)]
+-#[cfg_attr(target_os = "macos", ignore)]
+ fn forward_env_live_reload_zsh() -> anyhow::Result<()> {
+-    let mut daemon_proc = support::daemon::Proc::new("forward_env_zsh.toml", DaemonArgs::default())
++    let config_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
++    let config = support::shell_config(&config_dir, "forward_env_zsh.toml.tmpl", "zsh")?;
++    let mut daemon_proc = support::daemon::Proc::new(&config, DaemonArgs::default())
+         .context("starting daemon proc")?;
+ 
+     let mut waiter = daemon_proc
+@@ -498,11 +499,11 @@ fn forward_env_live_reload_zsh() -> anyhow::Result<()> {
+ 
+ #[test]
+ #[timeout(30000)]
+-#[cfg_attr(target_os = "macos", ignore)]
+ fn forward_env_live_reload_fish() -> anyhow::Result<()> {
+-    let mut daemon_proc =
+-        support::daemon::Proc::new("forward_env_fish.toml", DaemonArgs::default())
+-            .context("starting daemon proc")?;
++    let config_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
++    let config = support::shell_config(&config_dir, "forward_env_fish.toml.tmpl", "fish")?;
++    let mut daemon_proc = support::daemon::Proc::new(&config, DaemonArgs::default())
++        .context("starting daemon proc")?;
+ 
+     let run_fish = |proc: &mut support::attach::Proc, cmd: &str| -> anyhow::Result<()> {
+         proc.run_raw(format!("{cmd}\r").into_bytes())
+@@ -1759,11 +1760,11 @@ fn prompt_prefix_bash() -> anyhow::Result<()> {
+ 
+ #[test]
+ #[timeout(30000)]
+-#[cfg_attr(target_os = "macos", ignore)] // hard-coded /usr/bin/zsh path
+ fn prompt_prefix_zsh() -> anyhow::Result<()> {
+-    let mut daemon_proc =
+-        support::daemon::Proc::new("prompt_prefix_zsh.toml", DaemonArgs::default())
+-            .context("starting daemon proc")?;
++    let config_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
++    let config = support::shell_config(&config_dir, "prompt_prefix_zsh.toml.tmpl", "zsh")?;
++    let mut daemon_proc = support::daemon::Proc::new(&config, DaemonArgs::default())
++        .context("starting daemon proc")?;
+     let mut waiter = daemon_proc.events.take().unwrap().waiter(["daemon-wrote-s2c-chunk"]);
+ 
+     let mut attach_proc = daemon_proc.attach("sh1", AttachArgs::default())?;
+@@ -1895,7 +1896,6 @@ fn snapshot_attach_output<P: AsRef<OsStr>>(
+ 
+ #[test]
+ #[timeout(30000)]
+-#[cfg_attr(target_os = "macos", ignore)] // pager pty output issue
+ fn motd_pager() -> anyhow::Result<()> {
+     // set up the config
+     let tmp_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
+@@ -1944,7 +1944,6 @@ fn motd_pager() -> anyhow::Result<()> {
+ 
+ #[test]
+ #[timeout(30000)]
+-#[cfg_attr(target_os = "macos", ignore)] // pager pty output issue
+ fn motd_debounced_pager_debounces() -> anyhow::Result<()> {
+     // set up the config
+     let tmp_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
+@@ -1997,7 +1996,6 @@ fn motd_debounced_pager_debounces() -> anyhow::Result<()> {
+ 
+ #[test]
+ #[timeout(30000)]
+-#[cfg_attr(target_os = "macos", ignore)] // pager pty output issue
+ fn motd_debounced_pager_unbounces() -> anyhow::Result<()> {
+     // set up the config
+     let tmp_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
+@@ -2053,7 +2051,6 @@ fn motd_debounced_pager_unbounces() -> anyhow::Result<()> {
+ 
+ #[test]
+ #[timeout(30000)]
+-#[cfg_attr(target_os = "macos", ignore)] // pager pty output issue
+ fn motd_env_test_pager_preserves_term_env_var() -> anyhow::Result<()> {
+     // set up the config
+     let tmp_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
+diff --git a/shpool/tests/data/forward_env_fish.toml b/shpool/tests/data/forward_env_fish.toml
+deleted file mode 100644
+index e748643f..00000000
+--- a/shpool/tests/data/forward_env_fish.toml
++++ /dev/null
+@@ -1,9 +0,0 @@
+-norc = true
+-noecho = true
+-shell = "/usr/bin/fish"
+-session_restore_mode = "simple"
+-prompt_prefix = "shpool> "
+-forward_env = ["FOO", "BAR"]
+-
+-[env]
+-TERM = ""
+diff --git a/shpool/tests/data/forward_env_fish.toml.tmpl b/shpool/tests/data/forward_env_fish.toml.tmpl
+new file mode 100644
+index 00000000..5afa552a
+--- /dev/null
++++ b/shpool/tests/data/forward_env_fish.toml.tmpl
+@@ -0,0 +1,9 @@
++norc = true
++noecho = true
++shell = "SHELL"
++session_restore_mode = "simple"
++prompt_prefix = "shpool> "
++forward_env = ["FOO", "BAR"]
++
++[env]
++TERM = ""
+diff --git a/shpool/tests/data/forward_env_zsh.toml b/shpool/tests/data/forward_env_zsh.toml
+deleted file mode 100644
+index 53b5eb9f..00000000
+--- a/shpool/tests/data/forward_env_zsh.toml
++++ /dev/null
+@@ -1,9 +0,0 @@
+-norc = true
+-noecho = true
+-shell = "/usr/bin/zsh"
+-session_restore_mode = "simple"
+-prompt_prefix = "shpool> "
+-forward_env = ["FOO", "BAR"]
+-
+-[env]
+-TERM = ""
+diff --git a/shpool/tests/data/forward_env_zsh.toml.tmpl b/shpool/tests/data/forward_env_zsh.toml.tmpl
+new file mode 100644
+index 00000000..5afa552a
+--- /dev/null
++++ b/shpool/tests/data/forward_env_zsh.toml.tmpl
+@@ -0,0 +1,9 @@
++norc = true
++noecho = true
++shell = "SHELL"
++session_restore_mode = "simple"
++prompt_prefix = "shpool> "
++forward_env = ["FOO", "BAR"]
++
++[env]
++TERM = ""
+diff --git a/shpool/tests/data/prompt_prefix_zsh.toml b/shpool/tests/data/prompt_prefix_zsh.toml
+deleted file mode 100644
+index a512fc04..00000000
+--- a/shpool/tests/data/prompt_prefix_zsh.toml
++++ /dev/null
+@@ -1,9 +0,0 @@
+-norc = true
+-noecho = true
+-shell = "/usr/bin/zsh"
+-session_restore_mode = "simple"
+-prompt_prefix="session_name=$SHPOOL_SESSION_NAME "
+-
+-[env]
+-TERM = ""
+-
+diff --git a/shpool/tests/data/prompt_prefix_zsh.toml.tmpl b/shpool/tests/data/prompt_prefix_zsh.toml.tmpl
+new file mode 100644
+index 00000000..e8c581c5
+--- /dev/null
++++ b/shpool/tests/data/prompt_prefix_zsh.toml.tmpl
+@@ -0,0 +1,9 @@
++norc = true
++noecho = true
++shell = "SHELL"
++session_restore_mode = "simple"
++prompt_prefix="session_name=$SHPOOL_SESSION_NAME "
++
++[env]
++TERM = ""
++
+diff --git a/shpool/tests/support/mod.rs b/shpool/tests/support/mod.rs
+index 067d5bca..c480cf40 100644
+--- a/shpool/tests/support/mod.rs
++++ b/shpool/tests/support/mod.rs
+@@ -19,6 +19,34 @@ pub mod events;
+ pub mod line_matcher;
+ pub mod tmpdir;
+ 
++/// Find a shell by name, on $PATH and then in the places systems put
++/// them (zsh is /bin/zsh on macOS, fish is wherever homebrew put it), so
++/// that tests don't depend on one system's layout.
++pub fn find_shell(name: &str) -> anyhow::Result<PathBuf> {
++    let path = env::var_os("PATH").unwrap_or_default();
++    env::split_paths(&path)
++        .chain(["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"].map(PathBuf::from))
++        .map(|dir| dir.join(name))
++        .find(|candidate| candidate.is_file())
++        .ok_or(anyhow!("{name} not found: install it to run this test"))
++}
++
++/// Fill in a config template from the testdata directory whose `shell` is
++/// the placeholder "SHELL" with the path to the named shell, write it into
++/// `dir`, and return its path.
++pub fn shell_config(dir: &tmpdir::Dir, template: &str, shell: &str) -> anyhow::Result<PathBuf> {
++    let tmpl = std::fs::read_to_string(testdata_file(template))
++        .with_context(|| format!("reading {template}"))?;
++    let shell = find_shell(shell)?;
++    let config = dir.path().join(template.trim_end_matches(".tmpl"));
++    std::fs::write(
++        &config,
++        tmpl.replace("\"SHELL\"", &format!("{:?}", shell.display().to_string())),
++    )
++    .context("writing config")?;
++    Ok(config)
++}
++
+ pub fn testdata_file<P: AsRef<Path>>(file: P) -> PathBuf {
+     let mut dir = cargo_dir();
+     dir.pop();
