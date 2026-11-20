@@ -18,6 +18,7 @@ seam: every patch here is also offered to shpool, and goes once a shpool release
 | `03-vt100-seam.patch` | becomes a version bump once shpool_vt100 releases the fix |
 | `04-test-timing.patch` | not yet offered (tests only: three unit tests wait instead of assuming a timing) |
 | `vt100/01-last-n-rows.patch` | [shell-pool/shpool_vt100#2](https://github.com/shell-pool/shpool_vt100/pull/2) |
+| `vt100/02-restore-pending-wrap.patch` | branch `wmacevoy/shpool_vt100:fix/restore-cursor-pending-wrap`; PR not yet opened |
 
 To change one: edit the copy in `.build/core`, see it build and `tools/check.sh` pass, and cut
 the patch again from the difference (`git diff` in a checkout of `core/` with the earlier patches

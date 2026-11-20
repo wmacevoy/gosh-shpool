@@ -1,0 +1,71 @@
+Copyright 2026 Warren D. MacEvoy. Apache-2.0. See LICENSE.
+
+What:   restoring the cursor (DECRC, ESC 8) keeps a pending wrap. restore_cursor clamped the
+        column to size.cols - 1, but size.cols is where the cursor waits after writing to the
+        last column; clamping it made the next character overwrite the last one of the row
+        instead of starting the next row (lost input on screen). It also broke restoring such
+        a screen on reattach, since contents_formatted encodes a pending wrap with DECSC/DECRC.
+        Only a column beyond size.cols (the screen shrank after the save) is clamped now.
+        Fixes el, il_dl and relative_movement in tests/csi.rs, failing since the clamp came in
+        (1348bec), so shpool_vt100's whole suite passes.
+Where:  src/grid.rs (restore_cursor), tests/escape.rs (two tests).
+Shape:  fixes behaviour.
+Needs:  01-last-n-rows.patch before it (cut against its result; they share no lines).
+Status: offered upstream on branch wmacevoy/shpool_vt100:fix/restore-cursor-pending-wrap
+        (PR to shell-pool/shpool_vt100 not yet opened).
+
+diff --git a/src/grid.rs b/src/grid.rs
+index 0582bd0..6bd810a 100644
+--- a/src/grid.rs
++++ b/src/grid.rs
+@@ -118,7 +118,12 @@ impl Grid {
+             } else {
+                 self.saved_pos.row
+             },
+-            col: if self.saved_pos.col >= self.size.cols {
++            // A column of exactly size.cols is not out of bounds: it is
++            // where the cursor waits after writing to the last column,
++            // until the next character wraps it, and it must be kept.
++            // Only a column beyond that (the screen has shrunk since the
++            // save) is brought back onto the screen.
++            col: if self.saved_pos.col > self.size.cols {
+                 self.size.cols - 1
+             } else {
+                 self.saved_pos.col
+diff --git a/tests/escape.rs b/tests/escape.rs
+index 32f78e2..9599515 100644
+--- a/tests/escape.rs
++++ b/tests/escape.rs
+@@ -77,3 +77,32 @@ fn restore_out_of_bounds_pos() {
+     // restore cursor
+     parser.process(b"\x1b8");
+ }
++
++#[test]
++fn restore_keeps_a_pending_wrap() {
++    // Filling a row leaves the cursor past its last column, waiting to wrap.
++    // Saving and restoring the cursor there must keep it waiting, so that
++    // the next character starts the next row rather than overwriting the
++    // last character of this one.
++    let mut parser = shpool_vt100::Parser::new(5, 10, 0);
++    parser.process(b"0123456789");
++    assert_eq!(parser.screen().cursor_position(), (0, 10));
++
++    parser.process(b"\x1b7\x1b8");
++    assert_eq!(parser.screen().cursor_position(), (0, 10));
++
++    parser.process(b"X");
++    let rows: Vec<String> = parser.screen().rows(0, 10).take(2).collect();
++    assert_eq!(rows, vec!["0123456789", "X"]);
++}
++
++#[test]
++fn restore_after_shrinking_lands_on_the_screen() {
++    // A cursor saved further right than the screen is wide after a resize
++    // comes back on the screen, in its last column.
++    let mut parser = shpool_vt100::Parser::new(5, 10, 0);
++    parser.process(b"\x1b[1;9H\x1b7");
++    parser.screen_mut().set_size(5, 4);
++    parser.process(b"\x1b8");
++    assert_eq!(parser.screen().cursor_position(), (0, 3));
++}

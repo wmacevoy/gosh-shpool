@@ -5,8 +5,8 @@
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 "$ROOT/tools/build.sh"
-# shpool_vt100's tests of what the seam changes there (its whole suite has tests that fail as
-# published: el, il_dl, relative_movement in tests/csi.rs)
-(cd "$ROOT/.build/vt100" && cargo test --test window_contents)
+# shpool_vt100's whole suite (which passes with the seam: vt100/02 fixes the csi tests that
+# fail as published)
+(cd "$ROOT/.build/vt100" && cargo test)
 cd "$ROOT/.build/core"
 cargo test --locked "$@"
