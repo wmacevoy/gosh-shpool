@@ -4,8 +4,11 @@ What:   lets shpool's own tests run on macOS where they were skipped for reasons
         not of shpool. The zsh and fish tests named /usr/bin/zsh and /usr/bin/fish (macOS has
         /bin/zsh, and homebrew's fish is elsewhere); they now find the shell on $PATH and in the
         usual places (support::find_shell, support::shell_config), and say so if it is not
-        installed. The four motd pager tests, skipped for a "pager pty output issue", pass on
-        macOS now and are no longer skipped.
+        installed. forward_env_live_reload_zsh and the four motd pager tests (skipped for a
+        "pager pty output issue") pass on macOS and are no longer skipped there. Two stay
+        skipped on macOS, now with the reason seen on macOS runners: the fish test (fish 4
+        waits for the terminal to answer a query) and prompt_prefix_zsh (macOS zsh draws no
+        prefix, the same with shpool as released).
 Where:  shpool/tests only: attach.rs, support/mod.rs, and the three configs that named a shell
         path, which become templates (data/*.toml -> data/*.toml.tmpl).
 Shape:  tests only; shpool itself is unchanged.
@@ -13,11 +16,7 @@ Needs:  01-rename.patch before it (cut against its result).
 Status: to be offered upstream (shell-pool/shpool).
 
 diff --git a/shpool/tests/attach.rs b/shpool/tests/attach.rs
-index fbe18beb..7722493a 100644
---- a/shpool/tests/attach.rs
-+++ b/shpool/tests/attach.rs
-diff --git a/shpool/tests/attach.rs b/shpool/tests/attach.rs
-index fbe18beb..7722493a 100644
+index fbe18beb..087d205a 100644
 --- a/shpool/tests/attach.rs
 +++ b/shpool/tests/attach.rs
 @@ -399,9 +399,10 @@ fn forward_env_live_reload_bash() -> anyhow::Result<()> {
@@ -33,11 +32,13 @@ index fbe18beb..7722493a 100644
          .context("starting daemon proc")?;
  
      let mut waiter = daemon_proc
-@@ -498,11 +499,11 @@ fn forward_env_live_reload_zsh() -> anyhow::Result<()> {
+@@ -498,11 +499,14 @@ fn forward_env_live_reload_zsh() -> anyhow::Result<()> {
  
  #[test]
  #[timeout(30000)]
--#[cfg_attr(target_os = "macos", ignore)]
++// fish 4 (homebrew's) waits at startup for the terminal to answer a query,
++// and the test's terminal never answers. fish 3 doesn't ask.
+ #[cfg_attr(target_os = "macos", ignore)]
  fn forward_env_live_reload_fish() -> anyhow::Result<()> {
 -    let mut daemon_proc =
 -        support::daemon::Proc::new("forward_env_fish.toml", DaemonArgs::default())
@@ -49,11 +50,14 @@ index fbe18beb..7722493a 100644
  
      let run_fish = |proc: &mut support::attach::Proc, cmd: &str| -> anyhow::Result<()> {
          proc.run_raw(format!("{cmd}\r").into_bytes())
-@@ -1759,11 +1760,11 @@ fn prompt_prefix_bash() -> anyhow::Result<()> {
+@@ -1759,11 +1763,14 @@ fn prompt_prefix_bash() -> anyhow::Result<()> {
  
  #[test]
  #[timeout(30000)]
 -#[cfg_attr(target_os = "macos", ignore)] // hard-coded /usr/bin/zsh path
++// macOS's zsh (5.9) draws no prompt prefix here: the same with shpool as
++// released, so not a matter of the shell's path. Not yet understood.
++#[cfg_attr(target_os = "macos", ignore)]
  fn prompt_prefix_zsh() -> anyhow::Result<()> {
 -    let mut daemon_proc =
 -        support::daemon::Proc::new("prompt_prefix_zsh.toml", DaemonArgs::default())
@@ -65,7 +69,7 @@ index fbe18beb..7722493a 100644
      let mut waiter = daemon_proc.events.take().unwrap().waiter(["daemon-wrote-s2c-chunk"]);
  
      let mut attach_proc = daemon_proc.attach("sh1", AttachArgs::default())?;
-@@ -1895,7 +1896,6 @@ fn snapshot_attach_output<P: AsRef<OsStr>>(
+@@ -1895,7 +1902,6 @@ fn snapshot_attach_output<P: AsRef<OsStr>>(
  
  #[test]
  #[timeout(30000)]
@@ -73,7 +77,7 @@ index fbe18beb..7722493a 100644
  fn motd_pager() -> anyhow::Result<()> {
      // set up the config
      let tmp_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
-@@ -1944,7 +1944,6 @@ fn motd_pager() -> anyhow::Result<()> {
+@@ -1944,7 +1950,6 @@ fn motd_pager() -> anyhow::Result<()> {
  
  #[test]
  #[timeout(30000)]
@@ -81,7 +85,7 @@ index fbe18beb..7722493a 100644
  fn motd_debounced_pager_debounces() -> anyhow::Result<()> {
      // set up the config
      let tmp_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
-@@ -1997,7 +1996,6 @@ fn motd_debounced_pager_debounces() -> anyhow::Result<()> {
+@@ -1997,7 +2002,6 @@ fn motd_debounced_pager_debounces() -> anyhow::Result<()> {
  
  #[test]
  #[timeout(30000)]
@@ -89,7 +93,7 @@ index fbe18beb..7722493a 100644
  fn motd_debounced_pager_unbounces() -> anyhow::Result<()> {
      // set up the config
      let tmp_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
-@@ -2053,7 +2051,6 @@ fn motd_debounced_pager_unbounces() -> anyhow::Result<()> {
+@@ -2053,7 +2057,6 @@ fn motd_debounced_pager_unbounces() -> anyhow::Result<()> {
  
  #[test]
  #[timeout(30000)]
