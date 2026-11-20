@@ -16,6 +16,7 @@ seam: every patch here is also offered to shpool, and goes once a shpool release
 | `01-rename.patch` | [shell-pool/shpool#459](https://github.com/shell-pool/shpool/pull/459) |
 | `02-macos-tests.patch` | not yet offered (tests only: find zsh/fish, unskip tests that pass on macOS) |
 | `03-vt100-seam.patch` | becomes a version bump once shpool_vt100 releases the fix |
+| `04-test-timing.patch` | not yet offered (tests only: three unit tests wait instead of assuming a timing) |
 | `vt100/01-last-n-rows.patch` | not yet offered to [shell-pool/shpool_vt100](https://github.com/shell-pool/shpool_vt100) |
 
 To change one: edit the copy in `.build/core`, see it build and `tools/check.sh` pass, and cut

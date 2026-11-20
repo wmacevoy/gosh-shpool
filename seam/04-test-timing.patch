@@ -1,0 +1,122 @@
+Copyright 2026 Warren D. MacEvoy. Apache-2.0. See LICENSE.
+
+What:   three of shpool's unit tests that fail now and then on a busy CI runner, made to wait
+        for what they check instead of assuming a timing:
+        - peer::exe_for_pid_resolves_a_different_process read /proc/<pid>/exe of a child it had
+          just spawned, which can still be the test binary before the child's exec is done
+          (seen twice on ubuntu-22.04: it got libshpool-<hash>, not /usr/bin/sleep). It now
+          waits (up to 10s) for the child's exe to stop being ours.
+        - config_watcher::writes_larger_than_debounce slept a fixed time between two writes,
+          so a late event for the first could share the second's debounce window (1 reload,
+          not 2; seen on macos-latest). It now waits for the first reload before the second write.
+        - config_watcher::debounce wrote twice inside a 50ms window that a descheduled test
+          thread can overrun (seen on ubuntu-22.04). It now uses a 500ms window and waits for the
+          reload rather than sleeping; it was skipped on macOS for timing and no longer is.
+        Each then checks that no extra reload comes.
+Where:  libshpool/src/daemon/peer.rs and libshpool/src/config_watcher.rs, in their tests only.
+Shape:  tests only; shpool itself is unchanged.
+Needs:  03-vt100-seam.patch before it (cut against its result; it touches none of its lines).
+Status: to be offered upstream (shell-pool/shpool).
+
+diff --git a/libshpool/src/config_watcher.rs b/libshpool/src/config_watcher.rs
+index 9900ae17..7e84d548 100644
+--- a/libshpool/src/config_watcher.rs
++++ b/libshpool/src/config_watcher.rs
+@@ -599,9 +599,17 @@ mod test {
+         watcher: ConfigWatcher,
+     }
+ 
++    // How long a test waits for a reload it expects. Generous, since it only
++    // runs out when the reload never comes.
++    const RELOAD_WAIT: Duration = Duration::from_secs(10);
++
+     // Setup file structure at <tmpdir>/`base`, configure watcher to watch
+     // <tmpdir>/`base`/`target`
+     fn setup(base: &str, target: &str) -> Result<WatcherState> {
++        setup_with_debounce(base, target, DEBOUNCE_TIME)
++    }
++
++    fn setup_with_debounce(base: &str, target: &str, debounce: Duration) -> Result<WatcherState> {
+         let tmpdir = tempfile::tempdir()?;
+         let base_path = tmpdir.path().join(base);
+         let target_path = base_path.join(target);
+@@ -613,7 +621,7 @@ mod test {
+         let (tx, rx) = unbounded();
+         let watcher = ConfigWatcher::with_options(
+             move || tx.send(()).unwrap(),
+-            Options { debounce: DEBOUNCE_TIME, poll_interval: POLL_INTERVAL },
++            Options { debounce, poll_interval: POLL_INTERVAL },
+         )?;
+         watcher.watch(&target_path)?;
+ 
+@@ -628,9 +636,11 @@ mod test {
+ 
+     #[test]
+     #[timeout(30000)]
+-    #[cfg_attr(target_os = "macos", ignore)]
+     fn debounce() {
+-        let state = setup("base", "sub/config.toml").unwrap();
++        // A window far longer than the gap between two back-to-back writes
++        // can be, even on a busy machine, so that both land in it.
++        let debounce = Duration::from_millis(500);
++        let state = setup_with_debounce("base", "sub/config.toml", debounce).unwrap();
+ 
+         state.watcher.worker_ready();
+         // Write twice in quick succession - both should be within debounce
+@@ -638,10 +648,8 @@ mod test {
+         fs::write(&state.target_path, "test").unwrap();
+         fs::write(&state.target_path, "another").unwrap();
+ 
+-        drop_watcher(state.watcher);
+-
+-        let reloads: Vec<_> = state.rx.into_iter().collect();
+-        assert_eq!(reloads.len(), 1);
++        state.rx.recv_timeout(RELOAD_WAIT).expect("a reload");
++        assert!(state.rx.recv_timeout(debounce * 2).is_err(), "a second reload");
+     }
+ 
+     #[test]
+@@ -651,15 +659,15 @@ mod test {
+ 
+         state.watcher.worker_ready();
+         fs::write(&state.target_path, "test").unwrap();
++        // Wait for the first write's reload rather than for a fixed time, so
++        // that a late event for it can't share the second write's window.
++        state.rx.recv_timeout(RELOAD_WAIT).expect("a reload for the first write");
+ 
+-        thread::sleep(DEBOUNCE_TIME * 2);
+         state.watcher.worker_ready();
+         fs::write(&state.target_path, "another").unwrap();
++        state.rx.recv_timeout(RELOAD_WAIT).expect("a reload for the second write");
+ 
+-        drop_watcher(state.watcher);
+-
+-        let reloads: Vec<_> = state.rx.into_iter().collect();
+-        assert_eq!(reloads.len(), 2);
++        assert!(state.rx.recv_timeout(DEBOUNCE_TIME * 4).is_err(), "a third reload");
+     }
+ 
+     #[test]
+diff --git a/libshpool/src/daemon/peer.rs b/libshpool/src/daemon/peer.rs
+index 4b77e256..a5ec886f 100644
+--- a/libshpool/src/daemon/peer.rs
++++ b/libshpool/src/daemon/peer.rs
+@@ -209,7 +209,17 @@ mod tests {
+         let mut child = Command::new("/bin/sleep").arg("30").spawn().expect("spawning /bin/sleep");
+         let pid = unistd::Pid::from_raw(child.id() as libc::pid_t);
+ 
+-        let exe = exe_for_pid(pid).expect("resolving the child's exe");
++        // spawn() can return before the child has finished exec'ing, while
++        // its exe is still ours, so wait (a while) for it to become sleep's.
++        let ours = std::env::current_exe().expect("looking up our own exe");
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
++        let exe = loop {
++            let exe = exe_for_pid(pid).expect("resolving the child's exe");
++            if exe != ours || std::time::Instant::now() > deadline {
++                break exe;
++            }
++            std::thread::sleep(std::time::Duration::from_millis(5));
++        };
+         assert_eq!(exe, std::fs::canonicalize("/bin/sleep").expect("canonicalizing /bin/sleep"));
+ 
+         child.kill().expect("killing the child");
