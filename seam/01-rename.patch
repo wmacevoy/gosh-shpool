@@ -1,0 +1,1584 @@
+Copyright 2026 Warren D. MacEvoy. Apache-2.0. See LICENSE.
+
+What:   `shpool rename [OLD_NAME] NEW_NAME`, and a SHPOOL_SESSION_ID that never changes, so that
+        remote-gosh can rename the shpool sessions behind its terminals (remote-gosh issue #3).
+Where:  the daemon's session table, attach, ttl reaper, prompt injection, the protocol, the CLI,
+        and tests (shpool/tests/rename.rs). Session directories become sessions/<id>.
+Shape:  adds a command and a protocol message, and reshapes how long-lived parts of the daemon
+        find a session (by id, not by name). Protocol version 0.4.4.
+Needs:  nothing before it.
+Status: offered upstream as https://github.com/shell-pool/shpool/pull/459 (closes shpool #57).
+        Drop this patch when a shpool release includes it, and move the pin to that release.
+
+diff --git a/CONFIG.md b/CONFIG.md
+index 06ed857e..5421036f 100644
+--- a/CONFIG.md
++++ b/CONFIG.md
+@@ -38,6 +38,14 @@ this allows you to write a custom prompt hook in your .rc files
+ that examines the `$SHPOOL_SESSION_NAME` environment variable
+ directly, or eschew a `shpool` prompt customization entirely.
+ 
++`$SHPOOL_SESSION_NAME` in the prompt prefix is expanded by the
++shell each time it draws a prompt, so the prompt follows
++`shpool rename`. The injected prompt hook is also what refreshes
++the `$SHPOOL_SESSION_NAME` variable itself after a rename, so if no
++hook is injected (for example because `prompt_prefix` is blank) the
++variable keeps the name the session started with. `$SHPOOL_SESSION_ID` never changes, and
++`shpool list --json` maps it to the session's current name.
++
+ ## Session Restore Mode
+ 
+ `shpool` can do a few different things when you re-attach to an existing
+diff --git a/EVENTS.md b/EVENTS.md
+index 25426b99..671af3ec 100644
+--- a/EVENTS.md
++++ b/EVENTS.md
+@@ -26,6 +26,7 @@ A subscriber connects to `events.socket` and reads events. The daemon ignores an
+ | `session.detached`             | A client disconnected from a still-running session.      |
+ | `session.removed`              | A session was removed (shell exited, killed, or reaped). |
+ | `session.window_title_changed` | A session's `window_title` changed.                      |
++| `session.renamed`              | A session was given a new name (see `shpool rename`).    |
+ 
+ Subscribers should ignore unknown `type` values so that future event types do
+ not break older consumers.
+diff --git a/README.md b/README.md
+index 860739db..f25d69b9 100644
+--- a/README.md
++++ b/README.md
+@@ -195,6 +195,15 @@ session with no session name arguments.
+ 
+ Kills a named shell session.
+ 
++#### shpool rename
++
++Gives a session a new name, as in `shpool rename old-name new-name`.
++Will rename the current session if run from inside a `shpool` session
++with just a new name. The session keeps running, and stays attached if
++it is attached. Its shell picks up the new name in `$SHPOOL_SESSION_NAME`
++and its prompt prefix the next time it draws a prompt. A session also
++has a `$SHPOOL_SESSION_ID`, which never changes.
++
+ #### shpool var
+ 
+ Manipulate shpool variables. Variables can be used in shpool session names using
+diff --git a/libshpool/src/attach.rs b/libshpool/src/attach.rs
+index 007ebd9c..c836ab9b 100644
+--- a/libshpool/src/attach.rs
++++ b/libshpool/src/attach.rs
+@@ -83,7 +83,15 @@ pub fn run(
+         None => None,
+     };
+ 
+-    let attach = Attach { config_manager, force, background, ttl, tmpls, socket };
++    let attach = Attach {
++        config_manager,
++        force,
++        background,
++        ttl,
++        tmpls,
++        socket,
++        session_id: Arc::new(Mutex::new(None)),
++    };
+ 
+     attach.run()
+ }
+@@ -95,6 +103,10 @@ struct Attach {
+     ttl: Option<time::Duration>,
+     tmpls: Templates,
+     socket: PathBuf,
++    /// The id of the session we are attached to, as reported by the daemon.
++    /// Shared with the signal handler so that resizes still reach the
++    /// session if it gets renamed.
++    session_id: Arc<Mutex<Option<u64>>>,
+ }
+ 
+ impl Attach {
+@@ -111,7 +123,14 @@ impl Attach {
+         let mut resolved = self.tmpls.apply(&var_map);
+ 
+         let sig_handler_session_name_slot = if !self.background {
+-            Some(SignalHandler::new(resolved.session_name.clone(), self.socket.clone()).spawn()?)
++            Some(
++                SignalHandler::new(
++                    resolved.session_name.clone(),
++                    Arc::clone(&self.session_id),
++                    self.socket.clone(),
++                )
++                .spawn()?,
++            )
+         } else {
+             None
+         };
+@@ -305,6 +324,7 @@ impl Attach {
+ 
+         let attach_resp: AttachReplyHeader = client.read_reply().context("reading attach reply")?;
+         info!("attach_resp.status={:?}", attach_resp.status);
++        *self.session_id.lock().unwrap() = attach_resp.session_id;
+ 
+         {
+             use shpool_protocol::AttachStatus::*;
+@@ -433,12 +453,13 @@ enum AttachResult {
+ 
+ struct SignalHandler {
+     session_name: Arc<Mutex<String>>,
++    session_id: Arc<Mutex<Option<u64>>>,
+     socket: PathBuf,
+ }
+ 
+ impl SignalHandler {
+-    fn new(session_name: String, socket: PathBuf) -> Self {
+-        SignalHandler { session_name: Arc::new(Mutex::new(session_name)), socket }
++    fn new(session_name: String, session_id: Arc<Mutex<Option<u64>>>, socket: PathBuf) -> Self {
++        SignalHandler { session_name: Arc::new(Mutex::new(session_name)), session_id, socket }
+     }
+ 
+     fn spawn(self) -> anyhow::Result<Arc<Mutex<String>>> {
+@@ -484,6 +505,7 @@ impl SignalHandler {
+         client
+             .write_connect_header(ConnectHeader::SessionMessage(SessionMessageRequest {
+                 session_name: self.get_session_name(),
++                session_id: *self.session_id.lock().unwrap(),
+                 payload: SessionMessageRequestPayload::Resize(ResizeRequest {
+                     tty_size: tty_size.clone(),
+                 }),
+diff --git a/libshpool/src/common.rs b/libshpool/src/common.rs
+index 162792a2..c6372390 100644
+--- a/libshpool/src/common.rs
++++ b/libshpool/src/common.rs
+@@ -14,9 +14,12 @@
+ 
+ //! The common module is a grab bag of shared utility functions.
+ 
+-use std::{env, thread, time};
++use std::{env, path::Path, thread, time};
+ 
+ use anyhow::anyhow;
++use shpool_protocol::{ConnectHeader, ListReply};
++
++use crate::protocol;
+ 
+ /// Controls how often `sleep_unless` re-checks its stop predicate.
+ #[derive(Clone, Copy, Debug)]
+@@ -74,9 +77,47 @@ where
+     }
+ }
+ 
+-pub fn resolve_sessions(sessions: &mut Vec<String>, action: &str) -> anyhow::Result<()> {
++/// The name of the session we are running in, if any.
++///
++/// $SHPOOL_SESSION_NAME is only refreshed when the shell draws a prompt,
++/// so it can be stale right after a rename. $SHPOOL_SESSION_ID never
++/// changes, so we prefer to ask the daemon for the name of the session
++/// with that id, and only fall back to $SHPOOL_SESSION_NAME if we can't.
++pub fn current_session_name<P>(socket: P) -> Option<String>
++where
++    P: AsRef<Path>,
++{
++    let by_id = env::var("SHPOOL_SESSION_ID")
++        .ok()
++        .and_then(|id| id.parse::<u64>().ok())
++        .and_then(|id| session_name_for_id(socket, id).ok().flatten());
++    by_id.or_else(|| env::var("SHPOOL_SESSION_NAME").ok())
++}
++
++fn session_name_for_id<P>(socket: P, id: u64) -> anyhow::Result<Option<String>>
++where
++    P: AsRef<Path>,
++{
++    let mut client = match protocol::Client::new(socket)? {
++        protocol::ClientResult::JustClient(c) => c,
++        // The caller will dial the daemon again and warn about this then.
++        protocol::ClientResult::VersionMismatch { client, .. } => client,
++    };
++    client.write_connect_header(ConnectHeader::List)?;
++    let reply: ListReply = client.read_reply()?;
++    Ok(reply.sessions.into_iter().find(|s| s.id == id).map(|s| s.name))
++}
++
++pub fn resolve_sessions<P>(
++    sessions: &mut Vec<String>,
++    action: &str,
++    socket: P,
++) -> anyhow::Result<()>
++where
++    P: AsRef<Path>,
++{
+     if sessions.is_empty() {
+-        if let Ok(current_session) = env::var("SHPOOL_SESSION_NAME") {
++        if let Some(current_session) = current_session_name(socket) {
+             sessions.push(current_session);
+         }
+     }
+diff --git a/libshpool/src/daemon/events.rs b/libshpool/src/daemon/events.rs
+index 970ce45e..b8a8f127 100644
+--- a/libshpool/src/daemon/events.rs
++++ b/libshpool/src/daemon/events.rs
+@@ -68,6 +68,8 @@ pub enum Event {
+     SessionRemoved,
+     #[serde(rename = "session.window_title_changed")]
+     SessionWindowTitleChanged,
++    #[serde(rename = "session.renamed")]
++    SessionRenamed,
+ }
+ 
+ /// The publish surface of the events system: fans out events to all
+@@ -502,12 +504,14 @@ fn serialize_line(event: &Event) -> Arc<str> {
+     static REMOVED: LazyLock<Arc<str>> = LazyLock::new(|| build(Event::SessionRemoved));
+     static WINDOW_TITLE_CHANGED: LazyLock<Arc<str>> =
+         LazyLock::new(|| build(Event::SessionWindowTitleChanged));
++    static RENAMED: LazyLock<Arc<str>> = LazyLock::new(|| build(Event::SessionRenamed));
+     match event {
+         Event::SessionCreated => Arc::clone(&CREATED),
+         Event::SessionAttached => Arc::clone(&ATTACHED),
+         Event::SessionDetached => Arc::clone(&DETACHED),
+         Event::SessionRemoved => Arc::clone(&REMOVED),
+         Event::SessionWindowTitleChanged => Arc::clone(&WINDOW_TITLE_CHANGED),
++        Event::SessionRenamed => Arc::clone(&RENAMED),
+     }
+ }
+ 
+@@ -632,6 +636,7 @@ mod tests {
+             (Event::SessionDetached, r#"{"type":"session.detached"}"#),
+             (Event::SessionRemoved, r#"{"type":"session.removed"}"#),
+             (Event::SessionWindowTitleChanged, r#"{"type":"session.window_title_changed"}"#),
++            (Event::SessionRenamed, r#"{"type":"session.renamed"}"#),
+         ];
+         for (event, expected) in &cases {
+             assert_eq!(json(event), *expected, "variant {event:?}");
+diff --git a/libshpool/src/daemon/server.rs b/libshpool/src/daemon/server.rs
+index 19d6fba0..e9ae9325 100644
+--- a/libshpool/src/daemon/server.rs
++++ b/libshpool/src/daemon/server.rs
+@@ -28,7 +28,10 @@ use std::{
+     },
+     path::{Path, PathBuf},
+     process,
+-    sync::Arc,
++    sync::{
++        atomic::{AtomicU64, Ordering},
++        Arc,
++    },
+     thread, time,
+     time::{Duration, Instant},
+ };
+@@ -38,9 +41,9 @@ use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
+ use shpool_protocol::{
+     AttachHeader, AttachReplyHeader, AttachStatus, Attachment, ConnectHeader, DetachReply,
+     DetachRequest, KillReply, KillRequest, ListReply, LogLevel, MaybeSwitch, ModifyVarReply,
+-    ModifyVarRequest, ResizeReply, Session, SessionMessageDetachReply, SessionMessageReply,
+-    SessionMessageRequest, SessionMessageRequestPayload, SessionStatus, SetLogLevelReply,
+-    SetLogLevelRequest, VersionHeader,
++    ModifyVarRequest, RenameReply, RenameRequest, ResizeReply, Session, SessionMessageDetachReply,
++    SessionMessageReply, SessionMessageRequest, SessionMessageRequestPayload, SessionStatus,
++    SetLogLevelReply, SetLogLevelRequest, VersionHeader,
+ };
+ use tracing::{debug, error, info, instrument, span, warn, Level};
+ 
+@@ -83,7 +86,9 @@ pub struct Server {
+     /// the main thread to become available to accept new connections.
+     shells: Arc<Mutex<HashMap<String, Box<shell::Session>>>>,
+     runtime_dir: PathBuf,
+-    register_new_reapable_session: crossbeam_channel::Sender<(String, Instant)>,
++    register_new_reapable_session: crossbeam_channel::Sender<(u64, Instant)>,
++    /// The source of session ids. See `shell::Session::id`.
++    next_session_id: AtomicU64,
+     hooks: Box<dyn hooks::Hooks + Send + Sync>,
+     events_bus: Arc<events::EventBus>,
+     daily_messenger: Arc<show_motd::DailyMessenger>,
+@@ -137,6 +142,7 @@ impl Server {
+             shells,
+             runtime_dir,
+             register_new_reapable_session: new_sess_tx,
++            next_session_id: AtomicU64::new(1),
+             hooks,
+             events_bus,
+             daily_messenger,
+@@ -221,7 +227,10 @@ impl Server {
+                 if let ConnectHeader::Attach(_) = header {
+                     write_reply(
+                         &mut stream,
+-                        AttachReplyHeader { status: AttachStatus::Forbidden(format!("{err:?}")) },
++                        AttachReplyHeader {
++                            status: AttachStatus::Forbidden(format!("{err:?}")),
++                            session_id: None,
++                        },
+                     )?;
+                 }
+                 stream.shutdown(net::Shutdown::Both).context("closing stream")?;
+@@ -244,6 +253,7 @@ impl Server {
+             ConnectHeader::SetLogLevel(r) => self.handle_set_log_level(stream, r),
+             ConnectHeader::GetVars => self.handle_get_vars(stream),
+             ConnectHeader::ModifyVar(r) => self.handle_modify_var(stream, r),
++            ConnectHeader::Rename(r) => self.handle_rename(stream, r),
+         }
+     }
+ 
+@@ -255,30 +265,33 @@ impl Server {
+         header: AttachHeader,
+         peer_pid: libc::pid_t,
+     ) -> anyhow::Result<()> {
+-        if header.name.chars().any(|c| '/' == c || c.is_whitespace())
+-            || header.name == "."
+-            || header.name == ".."
+-            || header.name.is_empty()
+-        {
++        if let Err(msg) = validate_session_name(&header.name) {
+             write_reply(
+                 &mut stream,
+-                AttachReplyHeader {
+-                    status: AttachStatus::UnexpectedError(format!(
+-                        "invalid session name '{}'",
+-                        header.name
+-                    )),
+-                },
++                AttachReplyHeader { status: AttachStatus::UnexpectedError(msg), session_id: None },
+             )?;
+             return Ok(());
+         }
+ 
++        // The id a new session would get. If we end up reattaching instead,
++        // it just goes unused.
++        let new_session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
++
+         let user_info = user::info().context("resolving user info")?;
+-        let shell_env = self.build_shell_env(&user_info, &header).context("building shell env")?;
++        let shell_env = self
++            .build_shell_env(&user_info, &header, new_session_id)
++            .context("building shell env")?;
+ 
+         test_hooks::emit("handle-attach-before-select-shell");
+-        let (shell_results, status) = match self
+-            .select_shell_desc(stream, conn_id, &header, &user_info, &shell_env, peer_pid)
+-        {
++        let (shell_results, status) = match self.select_shell_desc(
++            stream,
++            conn_id,
++            &header,
++            &user_info,
++            &shell_env,
++            peer_pid,
++            new_session_id,
++        ) {
+             Ok(t) => t,
+             Err(err)
+                 if err
+@@ -291,12 +304,16 @@ impl Server {
+             Err(err) => return Err(err)?,
+         };
+ 
+-        self.link_ssh_auth_sock(&header).context("linking SSH_AUTH_SOCK")?;
+-        self.populate_session_env_file(&header).context("populating session env file")?;
++        if let Some((_, _, _, session_id, forward_env)) = &shell_results {
++            self.link_ssh_auth_sock(&header, *session_id).context("linking SSH_AUTH_SOCK")?;
++            self.populate_session_env_file(&header, *session_id, forward_env)
++                .context("populating session env file")?;
++        }
+ 
+         test_hooks::emit("handle-attach-before-inner-session-lock");
+ 
+-        if let Some((child_exit_notifier, mut inner, pager_ctl_slot)) = shell_results {
++        if let Some((child_exit_notifier, mut inner, pager_ctl_slot, session_id, _)) = shell_results
++        {
+             let mut child_done = false;
+             let client_stream = match inner.client_stream.as_mut() {
+                 Some(s) => s,
+@@ -305,8 +322,10 @@ impl Server {
+                 }
+             };
+ 
+-            let reply_status =
+-                write_reply(client_stream, AttachReplyHeader { status: status.clone() });
++            let reply_status = write_reply(
++                client_stream,
++                AttachReplyHeader { status: status.clone(), session_id: Some(session_id) },
++            );
+             if let Err(e) = reply_status {
+                 error!("error writing reply status: {:?}", e);
+             }
+@@ -355,19 +374,31 @@ impl Server {
+             }
+             info!("bidi stream loop finished child_done={}", child_done);
+ 
++            // The session may have been renamed while we were streaming, so
++            // find it by id rather than by the name we attached with.
++            let session_name = {
++                let _s = span!(Level::INFO, "name_lock(shells)").entered();
++                let shells = self.shells.lock();
++                name_of_session_id(&shells, session_id)
++            };
++
+             if child_done {
+-                info!("'{}' exited, removing from session table", header.name);
+-                if let Err(err) = self.hooks.on_shell_disconnect(&header.name) {
++                let hook_name = session_name.as_deref().unwrap_or(&header.name);
++                info!("'{}' exited, removing from session table", hook_name);
++                if let Err(err) = self.hooks.on_shell_disconnect(hook_name) {
+                     warn!("shell_disconnect hook: {:?}", err);
+                 }
+ 
+                 {
+                     let _s = span!(Level::INFO, "2_lock(shells)").entered();
+                     let mut shells = self.shells.lock();
+-                    // The publish below is gated on `is_some()` because a
+-                    // concurrent kill or reaper may have already removed the
+-                    // entry (and published) while we were waiting for the lock.
+-                    if shells.remove(&header.name).is_some() {
++                    // The publish below is gated on finding the entry because
++                    // a concurrent kill or reaper may have already removed
++                    // it (and published) while we were waiting for the lock.
++                    // We look it up again since it may have been renamed
++                    // since we last looked.
++                    if let Some(name) = name_of_session_id(&shells, session_id) {
++                        shells.remove(&name);
+                         self.events_bus.publish(&events::Event::SessionRemoved);
+                     }
+                 }
+@@ -389,12 +420,13 @@ impl Server {
+                 {
+                     let _s = span!(Level::INFO, "disconnect_lock(shells)").entered();
+                     let shells = self.shells.lock();
+-                    if let Some(session) = shells.get(&header.name) {
++                    if let Some(session) = shells.values().find(|s| s.id == session_id) {
+                         session.lifecycle.record_detached();
+                         self.events_bus.publish(&events::Event::SessionDetached);
+                     }
+                 }
+-                if let Err(err) = self.hooks.on_client_disconnect(&header.name) {
++                let hook_name = session_name.as_deref().unwrap_or(&header.name);
++                if let Err(err) = self.hooks.on_client_disconnect(hook_name) {
+                     warn!("client_disconnect hook: {:?}", err);
+                 }
+             }
+@@ -407,7 +439,7 @@ impl Server {
+         Ok(())
+     }
+ 
+-    #[allow(clippy::type_complexity)]
++    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+     fn select_shell_desc(
+         &self,
+         mut stream: UnixStream,
+@@ -416,11 +448,14 @@ impl Server {
+         user_info: &user::Info,
+         shell_env: &[(OsString, OsString)],
+         peer_pid: libc::pid_t,
++        new_session_id: u64,
+     ) -> anyhow::Result<(
+         Option<(
+             Arc<ExitNotifier>,
+             ArcMutexGuard<RawMutex, shell::SessionInner>,
+             Arc<Mutex<Option<pager::PagerCtl>>>,
++            u64,
++            Arc<Mutex<shell::ForwardEnv>>,
+         )>,
+         AttachStatus,
+     )> {
+@@ -491,6 +526,8 @@ impl Server {
+                                         Arc::clone(&session.child_exit_notifier),
+                                         inner,
+                                         Arc::clone(&session.pager_ctl),
++                                        session.id,
++                                        Arc::clone(&session.forward_env),
+                                     )),
+                                     AttachStatus::Attached { warnings },
+                                 ));
+@@ -525,7 +562,10 @@ impl Server {
+                     info!("busy shell session, doing nothing");
+                     // The stream is busy, so we just inform the client and
+                     // close the stream.
+-                    write_reply(&mut stream, AttachReplyHeader { status: AttachStatus::Busy })?;
++                    write_reply(
++                        &mut stream,
++                        AttachReplyHeader { status: AttachStatus::Busy, session_id: None },
++                    )?;
+                     stream.shutdown(net::Shutdown::Both).context("closing stream")?;
+                     if let Err(err) = self.hooks.on_busy(&header.name) {
+                         warn!("busy hook: {:?}", err);
+@@ -549,6 +589,7 @@ impl Server {
+             user_info,
+             shell_env,
+             matches!(motd, MotdDisplayMode::Dump),
++            new_session_id,
+         )?;
+ 
+         session.lifecycle.record_attached(Attachment {
+@@ -581,6 +622,8 @@ impl Server {
+                     Arc::clone(&session.child_exit_notifier),
+                     session.inner.lock_arc(),
+                     Arc::clone(&session.pager_ctl),
++                    session.id,
++                    Arc::clone(&session.forward_env),
+                 )),
+                 AttachStatus::Created { warnings },
+             ))
+@@ -590,13 +633,13 @@ impl Server {
+     }
+ 
+     #[instrument(skip_all)]
+-    fn link_ssh_auth_sock(&self, header: &AttachHeader) -> anyhow::Result<()> {
++    fn link_ssh_auth_sock(&self, header: &AttachHeader, session_id: u64) -> anyhow::Result<()> {
+         if self.config.get().nosymlink_ssh_auth_sock.unwrap_or(false) {
+             return Ok(());
+         }
+ 
+         if let Some(ssh_auth_sock) = header.local_env_get("SSH_AUTH_SOCK") {
+-            let symlink = self.ssh_auth_sock_symlink(PathBuf::from(&header.name));
++            let symlink = self.ssh_auth_sock_symlink(session_id);
+             fs::create_dir_all(symlink.parent().ok_or(anyhow!("no symlink parent dir"))?)
+                 .context("could not create directory for SSH_AUTH_SOCK symlink")?;
+ 
+@@ -625,12 +668,29 @@ impl Server {
+     }
+ 
+     #[instrument(skip_all)]
+-    fn populate_session_env_file(&self, header: &AttachHeader) -> anyhow::Result<()> {
+-        let session_name = PathBuf::from(&header.name);
+-        let session_dir = self.session_dir(session_name.clone());
++    fn populate_session_env_file(
++        &self,
++        header: &AttachHeader,
++        session_id: u64,
++        forward_env: &Mutex<shell::ForwardEnv>,
++    ) -> anyhow::Result<()> {
++        let mut forward_env = forward_env.lock();
++        forward_env.local_env = header.local_env.clone();
++        self.write_session_env_file(session_id, &forward_env)
++    }
++
++    /// Write out a session's forward.env file. Callers must hold the
++    /// session's `forward_env` lock so that concurrent writes can't land
++    /// out of order.
++    fn write_session_env_file(
++        &self,
++        session_id: u64,
++        forward_env: &shell::ForwardEnv,
++    ) -> anyhow::Result<()> {
++        let session_dir = self.session_dir(session_id);
+         fs::create_dir_all(&session_dir).context("creating session dir")?;
+ 
+-        let session_env_file = self.session_env_file(session_name);
++        let session_env_file = self.session_env_file(session_id);
+         info!("populating {:?}", session_env_file);
+         let mut tmp_env_file = tempfile::Builder::new()
+             .prefix("shpool_session_env")
+@@ -642,7 +702,13 @@ impl Server {
+         // would overwrite that symlink on the next prompt and leave a stale
+         // path after a subsequent reattach.
+         let skip_ssh_auth_sock = !self.config.get().nosymlink_ssh_auth_sock.unwrap_or(false);
+-        let content = format_forward_env(&header.local_env, skip_ssh_auth_sock);
++        let mut content = format_forward_env(&forward_env.local_env, skip_ssh_auth_sock);
++        // Always (re)export the session name, so that a shell picks up a
++        // rename at its next prompt.
++        content.push_str(&format_forward_env(
++            &[(String::from("SHPOOL_SESSION_NAME"), forward_env.session_name.clone())],
++            false,
++        ));
+         tmp_env_file.write_all(content.as_bytes()).context("writing tmp env file")?;
+         tmp_env_file.persist(&session_env_file).context("persisting env file")?;
+ 
+@@ -843,6 +909,53 @@ impl Server {
+         Ok(())
+     }
+ 
++    #[instrument(skip_all)]
++    fn handle_rename(&self, mut stream: UnixStream, request: RenameRequest) -> anyhow::Result<()> {
++        let renamed = if let Err(msg) = validate_session_name(&request.new_name) {
++            Err(RenameReply::InvalidName(msg))
++        } else {
++            let _s = span!(Level::INFO, "lock(shells)").entered();
++            let mut shells = self.shells.lock();
++            if !shells.contains_key(&request.old_name) {
++                Err(RenameReply::NotFound)
++            } else if request.old_name == request.new_name {
++                Ok(None)
++            } else if shells.contains_key(&request.new_name) {
++                Err(RenameReply::AlreadyExists)
++            } else {
++                let session =
++                    shells.remove(&request.old_name).expect("just checked that the session exists");
++                let id = session.id;
++                let forward_env = Arc::clone(&session.forward_env);
++                // Update the name under the shells lock, so a reattach that
++                // writes forward.env after this point uses the new name.
++                forward_env.lock().session_name = request.new_name.clone();
++                shells.insert(request.new_name.clone(), session);
++                self.events_bus.publish(&events::Event::SessionRenamed);
++                Ok(Some((id, forward_env)))
++            }
++        };
++
++        let reply = match renamed {
++            Ok(Some((id, forward_env))) => {
++                info!("renamed session {} '{}' to '{}'", id, request.old_name, request.new_name);
++                // Let the shell pick up its new name at the next prompt.
++                // This is best effort, the rename has already happened.
++                let forward_env = forward_env.lock();
++                if let Err(err) = self.write_session_env_file(id, &forward_env) {
++                    warn!("writing env file after rename: {:?}", err);
++                }
++                RenameReply::Ok
++            }
++            Ok(None) => RenameReply::Ok,
++            Err(reply) => reply,
++        };
++
++        write_reply(&mut stream, reply).context("writing rename reply")?;
++
++        Ok(())
++    }
++
+     #[instrument(skip_all)]
+     fn handle_list(&self, mut stream: UnixStream) -> anyhow::Result<()> {
+         // None if the session's shell->client thread has exited.
+@@ -878,6 +991,7 @@ impl Server {
+                     Ok((
+                         Session {
+                             name: session_name.to_string(),
++                            id: session.id,
+                             started_at_unix_ms: session
+                                 .started_at
+                                 .duration_since(time::UNIX_EPOCH)?
+@@ -944,12 +1058,13 @@ impl Server {
+         &self,
+         header: SessionMessageRequest,
+     ) -> anyhow::Result<SessionMessageReply> {
+-        match header.payload {
++        let SessionMessageRequest { session_name, session_id, payload } = header;
++        match payload {
+             SessionMessageRequestPayload::Resize(resize_request) => {
+                 let pager_ctl = {
+                     let _s = span!(Level::INFO, "resize_lock_1(shells)").entered();
+                     let shells = self.shells.lock();
+-                    if let Some(session) = shells.get(&header.session_name) {
++                    if let Some(session) = lookup_session(&shells, &session_name, session_id) {
+                         Arc::clone(&session.pager_ctl)
+                     } else {
+                         return Ok(SessionMessageReply::NotFound);
+@@ -972,7 +1087,7 @@ impl Server {
+                     let shell_to_client_ctl = {
+                         let _s = span!(Level::INFO, "resize_lock_2(shells)").entered();
+                         let shells = self.shells.lock();
+-                        if let Some(session) = shells.get(&header.session_name) {
++                        if let Some(session) = lookup_session(&shells, &session_name, session_id) {
+                             Arc::clone(&session.shell_to_client_ctl)
+                         } else {
+                             return Ok(SessionMessageReply::NotFound);
+@@ -997,7 +1112,7 @@ impl Server {
+                 let shell_to_client_ctl = {
+                     let _s = span!(Level::INFO, "detach_lock(shells)").entered();
+                     let shells = self.shells.lock();
+-                    if let Some(session) = shells.get(&header.session_name) {
++                    if let Some(session) = lookup_session(&shells, &session_name, session_id) {
+                         Arc::clone(&session.shell_to_client_ctl)
+                     } else {
+                         return Ok(SessionMessageReply::NotFound);
+@@ -1014,7 +1129,7 @@ impl Server {
+                     .client_connection_ack
+                     .recv_timeout(SESSION_MSG_TIMEOUT)
+                     .context("getting client conn ack")?;
+-                info!("detached session({}), status = {:?}", header.session_name, status);
++                info!("detached session({}), status = {:?}", session_name, status);
+                 Ok(SessionMessageReply::Detach(SessionMessageDetachReply::Ok))
+             }
+         }
+@@ -1024,6 +1139,7 @@ impl Server {
+     /// session is wrapped in an Arc so the inner session can hold a Weak
+     /// back-reference to the session.
+     #[instrument(skip_all)]
++    #[allow(clippy::too_many_arguments)]
+     fn spawn_subshell(
+         &self,
+         conn_id: usize,
+@@ -1032,6 +1148,7 @@ impl Server {
+         user_info: &user::Info,
+         shell_env: &[(OsString, OsString)],
+         dump_motd_on_new_session: bool,
++        session_id: u64,
+     ) -> anyhow::Result<shell::Session> {
+         let shell = if let Some(s) = &self.config.get().shell {
+             s.clone()
+@@ -1217,12 +1334,11 @@ impl Server {
+                 .prompt_prefix
+                 .clone()
+                 .unwrap_or(String::from(DEFAULT_PROMPT_PREFIX));
+-            let session_dir = self.session_dir(&header.name);
++            let session_dir = self.session_dir(session_id);
+             if let Err(err) = shell_inject::maybe_setup(
+                 &mut fork,
+                 &prompt_prefix,
+                 header.start_cmd.as_ref().map(|c| c.as_ref()).unwrap_or(""),
+-                &header.name,
+                 &session_dir,
+             ) {
+                 warn!("issue injecting prefix: {:?}", err);
+@@ -1299,11 +1415,16 @@ impl Server {
+         if let Some(ttl_secs) = header.ttl_secs {
+             info!("registering session with ttl with the reaper");
+             self.register_new_reapable_session
+-                .send((header.name.clone(), Instant::now().add(Duration::from_secs(ttl_secs))))
++                .send((session_id, Instant::now().add(Duration::from_secs(ttl_secs))))
+                 .context("sending reapable session registration msg")?;
+         }
+ 
+         Ok(shell::Session {
++            id: session_id,
++            forward_env: Arc::new(Mutex::new(shell::ForwardEnv {
++                session_name: header.name.clone(),
++                local_env: vec![],
++            })),
+             shell_to_client_ctl,
+             pager_ctl: Arc::new(Mutex::new(None)),
+             child_pid,
+@@ -1321,10 +1442,11 @@ impl Server {
+         &self,
+         user_info: &user::Info,
+         header: &AttachHeader,
++        session_id: u64,
+     ) -> anyhow::Result<Vec<(OsString, OsString)>> {
+         let s = OsString::from;
+         let config = self.config.get();
+-        let auth_sock = self.ssh_auth_sock_symlink(PathBuf::from(&header.name));
++        let auth_sock = self.ssh_auth_sock_symlink(session_id);
+         let mut env = vec![
+             (s("HOME"), s(&user_info.home_dir)),
+             (
+@@ -1336,10 +1458,8 @@ impl Server {
+                     .unwrap_or(DEFAULT_INITIAL_SHELL_PATH)),
+             ),
+             (s("SHPOOL_SESSION_NAME"), s(&header.name)),
+-            (
+-                s("SHPOOL_SESSION_DIR"),
+-                self.session_dir(PathBuf::from(&header.name)).into_os_string(),
+-            ),
++            (s("SHPOOL_SESSION_ID"), OsString::from(session_id.to_string())),
++            (s("SHPOOL_SESSION_DIR"), self.session_dir(session_id).into_os_string()),
+             (s("SHELL"), s(&user_info.default_shell)),
+             (s("USER"), s(&user_info.user)),
+             (
+@@ -1422,16 +1542,55 @@ impl Server {
+ 
+     // Generate the path to the env file that is populated on every
+     // attach.
+-    fn session_env_file<P: AsRef<Path>>(&self, session_name: P) -> PathBuf {
+-        self.session_dir(session_name).join("forward.env")
++    fn session_env_file(&self, session_id: u64) -> PathBuf {
++        self.session_dir(session_id).join("forward.env")
++    }
++
++    fn ssh_auth_sock_symlink(&self, session_id: u64) -> PathBuf {
++        self.session_dir(session_id).join("ssh-auth-sock.socket")
++    }
++
++    // Keyed by id rather than name, since the shell holds onto paths in
++    // here (SHPOOL_SESSION_DIR, SSH_AUTH_SOCK) which must keep working
++    // after a rename, and must not be shared with a new session that
++    // takes over the old name.
++    fn session_dir(&self, session_id: u64) -> PathBuf {
++        self.runtime_dir.join("sessions").join(session_id.to_string())
+     }
++}
+ 
+-    fn ssh_auth_sock_symlink<P: AsRef<Path>>(&self, session_name: P) -> PathBuf {
+-        self.session_dir(session_name).join("ssh-auth-sock.socket")
++/// Check that a session name is something we are willing to use. Names
++/// can't have whitespace or slashes, and can't be special directory
++/// names.
++fn validate_session_name(name: &str) -> Result<(), String> {
++    if name.chars().any(|c| '/' == c || c.is_whitespace())
++        || name == "."
++        || name == ".."
++        || name.is_empty()
++    {
++        return Err(format!("invalid session name '{name}'"));
+     }
++    Ok(())
++}
++
++/// Find the current name of the session with the given id.
++fn name_of_session_id(
++    shells: &HashMap<String, Box<shell::Session>>,
++    session_id: u64,
++) -> Option<String> {
++    shells.iter().find(|(_, s)| s.id == session_id).map(|(name, _)| name.clone())
++}
+ 
+-    fn session_dir<P: AsRef<Path>>(&self, session_name: P) -> PathBuf {
+-        self.runtime_dir.join("sessions").join(session_name)
++/// Find the session a session message is addressed to, by id if the
++/// sender knows it and by name otherwise.
++fn lookup_session<'a>(
++    shells: &'a HashMap<String, Box<shell::Session>>,
++    session_name: &str,
++    session_id: Option<u64>,
++) -> Option<&'a shell::Session> {
++    match session_id {
++        Some(id) => shells.values().find(|s| s.id == id).map(|s| s.as_ref()),
++        None => shells.get(session_name).map(|s| s.as_ref()),
+     }
+ }
+ 
+diff --git a/libshpool/src/daemon/shell.rs b/libshpool/src/daemon/shell.rs
+index 70a1be5f..ff4b134b 100644
+--- a/libshpool/src/daemon/shell.rs
++++ b/libshpool/src/daemon/shell.rs
+@@ -110,6 +110,15 @@ pub struct SessionLifecycleState {
+ /// Session represent a shell session
+ #[derive(Debug)]
+ pub struct Session {
++    /// A daemon-assigned id that never changes, even when the session is
++    /// renamed. The session table is keyed by name, so threads that outlive
++    /// a single request (the attach thread, the ttl reaper) find their
++    /// session by id instead.
++    pub id: u64,
++    /// What gets written to the session's forward.env file. Guarded by its
++    /// own lock so that renames and reattaches, which both rewrite the file,
++    /// are serialized and the last write always reflects the latest state.
++    pub forward_env: Arc<Mutex<ForwardEnv>>,
+     pub started_at: time::SystemTime,
+     pub lifecycle: SessionLifecycle,
+     pub child_pid: libc::pid_t,
+@@ -156,6 +165,17 @@ impl Session {
+     }
+ }
+ 
++/// The contents of a session's forward.env file, which the prompt hook
++/// sources into the shell before each prompt.
++#[derive(Debug, Default)]
++pub struct ForwardEnv {
++    /// The session's current name, exported as SHPOOL_SESSION_NAME so that
++    /// the shell picks up renames.
++    pub session_name: String,
++    /// The variables forwarded from the most recent attach.
++    pub local_env: Vec<(String, String)>,
++}
++
+ /// ShellSessionInner contains values that the pipe thread needs to be
+ /// able to mutate and fully control.
+ #[derive(Debug)]
+diff --git a/libshpool/src/daemon/shell_inject.rs b/libshpool/src/daemon/shell_inject.rs
+index aaa1302f..14811c2b 100644
+--- a/libshpool/src/daemon/shell_inject.rs
++++ b/libshpool/src/daemon/shell_inject.rs
+@@ -65,7 +65,6 @@ pub fn maybe_setup(
+     pty_master: &mut shpool_pty::fork::Fork,
+     prompt_prefix: &str,
+     start_cmd: &str,
+-    session_name: &str,
+     session_dir: &Path,
+ ) -> anyhow::Result<()> {
+     let shell_pid = pty_master.child_pid().ok_or(anyhow!("no child pid"))?;
+@@ -77,7 +76,11 @@ pub fn maybe_setup(
+     debug!("sniffed shell type: {:?}", shell_type);
+ 
+     // now actually inject the prompt
+-    let prompt_prefix = prompt_prefix.replace("$SHPOOL_SESSION_NAME", session_name);
++    //
++    // We leave $SHPOOL_SESSION_NAME in the prefix for the shell to expand
++    // each time it draws the prompt rather than substituting it here. The
++    // prompt hook sources forward.env, which exports the current session
++    // name, just before it expands the prefix, so the prompt follows renames.
+ 
+     fs::create_dir_all(session_dir).context("creating session dir for prompt script")?;
+ 
+@@ -92,7 +95,7 @@ pub fn maybe_setup(
+         Ok(KnownShell::Bash) => {
+             let bash_script = std::str::from_utf8(BASH_PROMPT_SCRIPT)
+                 .context("decoding bash script template")?
+-                .replace(PROMPT_PREFIX_PLACEHOLDER, &prompt_prefix);
++                .replace(PROMPT_PREFIX_PLACEHOLDER, prompt_prefix);
+             let script_file = session_dir.join("prompt.bash");
+             fs::write(&script_file, bash_script.as_bytes())
+                 .context("writing bash prompt script")?;
+@@ -101,7 +104,7 @@ pub fn maybe_setup(
+         Ok(KnownShell::Zsh) => {
+             let zsh_script = std::str::from_utf8(ZSH_PROMPT_SCRIPT)
+                 .context("decoding zsh script template")?
+-                .replace(PROMPT_PREFIX_PLACEHOLDER, &prompt_prefix);
++                .replace(PROMPT_PREFIX_PLACEHOLDER, prompt_prefix);
+             let script_file = session_dir.join("prompt.zsh");
+             fs::write(&script_file, zsh_script.as_bytes()).context("writing zsh prompt script")?;
+             format!("\n . \"{}\"\n", script_file.display())
+@@ -109,7 +112,7 @@ pub fn maybe_setup(
+         Ok(KnownShell::Fish) => {
+             let fish_script = std::str::from_utf8(FISH_PROMPT_SCRIPT)
+                 .context("decoding fish script template")?
+-                .replace(PROMPT_PREFIX_PLACEHOLDER, &prompt_prefix);
++                .replace(PROMPT_PREFIX_PLACEHOLDER, prompt_prefix);
+             let script_file = session_dir.join("prompt.fish");
+             fs::write(&script_file, fish_script.as_bytes())
+                 .context("writing fish prompt script")?;
+diff --git a/libshpool/src/daemon/ttl_reaper.rs b/libshpool/src/daemon/ttl_reaper.rs
+index ad4da2e8..e9cf8a34 100644
+--- a/libshpool/src/daemon/ttl_reaper.rs
++++ b/libshpool/src/daemon/ttl_reaper.rs
+@@ -14,10 +14,11 @@
+ 
+ /*! The ttl reaper is responsible to reaping sessions which
+   have a ttl set. It uses a channel for a mailbox to listen
+-  for newly woken threads, adds a generation id to session
+-  names to avoid clobbering fresh session with the same
+-  session name as a previous session, and uses a min heap
+-  to schedule wakeups in order to reap threads on time.
++  for newly woken threads, tracks sessions by their id rather
++  than their name so that it never clobbers a fresh session
++  with the same name as a previous one and keeps tracking a
++  session across renames, and uses a min heap to schedule
++  wakeups in order to reap threads on time.
+ */
+ 
+ use std::{
+@@ -36,27 +37,21 @@ use super::shell;
+ /// Run the reaper thread loop. Should be invoked in a dedicated
+ /// thread.
+ pub fn run(
+-    new_sess: crossbeam_channel::Receiver<(String, Instant)>,
++    new_sess: crossbeam_channel::Receiver<(u64, Instant)>,
+     shells: Arc<Mutex<HashMap<String, Box<shell::Session>>>>,
+     events_bus: Arc<events::EventBus>,
+ ) -> anyhow::Result<()> {
+     let _s = span!(Level::INFO, "ttl_reaper").entered();
+ 
+     let mut heap = BinaryHeap::new();
+-    let mut gen_ids = HashMap::new();
+ 
+     loop {
+         // empty heap loop, just waiting for new sessions to watch
+         while heap.is_empty() {
+             match new_sess.recv() {
+-                Ok((session_name, reap_at)) => {
+-                    let gen_id = gen_ids.entry(session_name.clone()).or_insert(0);
+-                    *gen_id += 1;
+-                    info!(
+-                        "scheduling first sess {}:{} to be reaped at {:?}",
+-                        &session_name, *gen_id, reap_at
+-                    );
+-                    heap.push(Reapable { session_name, gen_id: *gen_id, reap_at });
++                Ok((session_id, reap_at)) => {
++                    info!("scheduling first sess {} to be reaped at {:?}", session_id, reap_at);
++                    heap.push(Reapable { session_id, reap_at });
+                 }
+                 Err(crossbeam_channel::RecvError) => {
+                     info!("bailing due to RecvError in empty heap loop");
+@@ -76,16 +71,10 @@ pub fn run(
+             crossbeam_channel::select! {
+                 recv(new_sess) -> new_sess_msg => {
+                     match new_sess_msg {
+-                        Ok((session_name, reap_at)) => {
+-                            let gen_id = gen_ids.entry(session_name.clone()).or_insert(0);
+-                            *gen_id += 1;
+-                            info!("scheduling {}:{} to be reaped at {:?}",
+-                                  &session_name, *gen_id, reap_at);
+-                            heap.push(Reapable {
+-                                session_name,
+-                                gen_id: *gen_id,
+-                                reap_at,
+-                            });
++                        Ok((session_id, reap_at)) => {
++                            info!("scheduling sess {} to be reaped at {:?}",
++                                  session_id, reap_at);
++                            heap.push(Reapable { session_id, reap_at });
+                         }
+                         Err(crossbeam_channel::RecvError) => {
+                             info!("bailing due to RecvError");
+@@ -97,27 +86,23 @@ pub fn run(
+                     let reapable = heap.pop()
+                         .expect("there to be an entry in a non-empty heap");
+                     info!("waking up to reap {:?}", reapable);
+-                    let current_gen = gen_ids.get(&reapable.session_name)
+-                        .copied().unwrap_or(0);
+-                    if current_gen != reapable.gen_id {
+-                        info!("ignoring {}:{} because current gen is {:?}",
+-                              &reapable.session_name, reapable.gen_id, current_gen);
+-                        continue;
+-                    }
+ 
+                     let _s = span!(Level::INFO, "lock(shells)").entered();
+                     let mut shells = shells.lock();
+-                    if let Some(sess) = shells.get(&reapable.session_name) {
++                    let found = shells.iter()
++                        .find(|(_, sess)| sess.id == reapable.session_id)
++                        .map(|(name, _)| name.clone());
++                    let Some(session_name) = found else {
++                        info!("sess {} is already gone, nothing to reap",
++                              reapable.session_id);
++                        continue;
++                    };
++                    if let Some(sess) = shells.get(&session_name) {
+                         if let Err(e) = sess.kill() {
+-                            warn!("error trying to kill '{}': {:?}",
+-                                  reapable.session_name, e);
++                            warn!("error trying to kill '{}': {:?}", session_name, e);
+                         }
+-                    } else {
+-                        warn!("tried to kill '{}' but it wasn't in the shells tab",
+-                              reapable.session_name);
+-                        continue;
+                     }
+-                    shells.remove(&reapable.session_name);
++                    shells.remove(&session_name);
+                     events_bus.publish(&events::Event::SessionRemoved);
+                 }
+             }
+@@ -129,8 +114,7 @@ pub fn run(
+ /// sessions that need to be cleaned up.
+ #[derive(Debug)]
+ struct Reapable {
+-    session_name: String,
+-    gen_id: usize,
++    session_id: u64,
+     reap_at: Instant,
+ }
+ 
+diff --git a/libshpool/src/detach.rs b/libshpool/src/detach.rs
+index 3d74cf62..12ea1525 100644
+--- a/libshpool/src/detach.rs
++++ b/libshpool/src/detach.rs
+@@ -23,7 +23,7 @@ pub fn run<P>(mut sessions: Vec<String>, socket: P) -> anyhow::Result<()>
+ where
+     P: AsRef<Path>,
+ {
+-    let mut client = match protocol::Client::new(socket) {
++    let mut client = match protocol::Client::new(&socket) {
+         Ok(ClientResult::JustClient(c)) => c,
+         Ok(ClientResult::VersionMismatch { warning, client }) => {
+             eprintln!("warning: {warning}, try restarting your daemon");
+@@ -38,7 +38,7 @@ where
+         }
+     };
+ 
+-    common::resolve_sessions(&mut sessions, "detach")?;
++    common::resolve_sessions(&mut sessions, "detach", &socket)?;
+ 
+     client
+         .write_connect_header(ConnectHeader::Detach(DetachRequest { sessions }))
+diff --git a/libshpool/src/kill.rs b/libshpool/src/kill.rs
+index 1eda0e8e..f260898c 100644
+--- a/libshpool/src/kill.rs
++++ b/libshpool/src/kill.rs
+@@ -23,7 +23,7 @@ pub fn run<P>(mut sessions: Vec<String>, socket: P) -> anyhow::Result<()>
+ where
+     P: AsRef<Path>,
+ {
+-    let mut client = match protocol::Client::new(socket) {
++    let mut client = match protocol::Client::new(&socket) {
+         Ok(ClientResult::JustClient(c)) => c,
+         Ok(ClientResult::VersionMismatch { warning, client }) => {
+             eprintln!("warning: {warning}, try restarting your daemon");
+@@ -38,7 +38,7 @@ where
+         }
+     };
+ 
+-    common::resolve_sessions(&mut sessions, "kill")?;
++    common::resolve_sessions(&mut sessions, "kill", &socket)?;
+ 
+     client
+         .write_connect_header(ConnectHeader::Kill(KillRequest { sessions }))
+diff --git a/libshpool/src/lib.rs b/libshpool/src/lib.rs
+index ee9e2ac1..a0056502 100644
+--- a/libshpool/src/lib.rs
++++ b/libshpool/src/lib.rs
+@@ -42,6 +42,7 @@ mod hooks;
+ mod kill;
+ mod list;
+ mod protocol;
++mod rename;
+ mod session_restore;
+ mod set_log_level;
+ mod template;
+@@ -227,6 +228,27 @@ will be used if it is present in the environment.")]
+         sessions: Vec<String>,
+     },
+ 
++    #[clap(about = "Give a session a new name
++
++The session keeps running and stays attached, if it is attached.
++Its shell picks up the new name in $SHPOOL_SESSION_NAME and in its
++prompt the next time it draws a prompt. $SHPOOL_SESSION_ID stays the
++same for the life of the session.
++
++If only a new name is given, the session this command is run from is
++renamed. It is an error to rename a session to a name that another
++session already has.")]
++    #[non_exhaustive]
++    Rename {
++        #[clap(
++            required = true,
++            num_args = 1..=2,
++            value_names = ["OLD_NAME", "NEW_NAME"],
++            help = "the session to rename (default: the current session) and its new name"
++        )]
++        names: Vec<String>,
++    },
++
+     #[clap(about = "lists all the running shell sessions")]
+     #[non_exhaustive]
+     List {
+@@ -473,6 +495,7 @@ pub unsafe fn run(
+         }
+         Commands::Detach { sessions } => detach::run(sessions, socket),
+         Commands::Kill { sessions } => kill::run(sessions, socket),
++        Commands::Rename { names } => rename::run(names, socket),
+         Commands::List { json } => list::run(socket, json),
+         Commands::SetLogLevel { level } => set_log_level::run(level, socket),
+         Commands::Var { command } => var::run(socket, command),
+diff --git a/libshpool/src/rename.rs b/libshpool/src/rename.rs
+new file mode 100644
+index 00000000..add75343
+--- /dev/null
++++ b/libshpool/src/rename.rs
+@@ -0,0 +1,69 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++use std::{io, path::Path};
++
++use anyhow::{anyhow, Context};
++use shpool_protocol::{ConnectHeader, RenameReply, RenameRequest};
++
++use crate::{common, protocol, protocol::ClientResult};
++
++pub fn run<P>(mut names: Vec<String>, socket: P) -> anyhow::Result<()>
++where
++    P: AsRef<Path>,
++{
++    let new_name = names.pop().ok_or(anyhow!("no new session name"))?;
++    let old_name = match names.pop() {
++        Some(name) => name,
++        None => match common::current_session_name(&socket) {
++            Some(name) => name,
++            None => {
++                eprintln!("no session to rename");
++                return Err(anyhow!("no session to rename"));
++            }
++        },
++    };
++
++    let mut client = match protocol::Client::new(&socket) {
++        Ok(ClientResult::JustClient(c)) => c,
++        Ok(ClientResult::VersionMismatch { warning, client }) => {
++            eprintln!("warning: {warning}, try restarting your daemon");
++            client
++        }
++        Err(err) => {
++            let io_err = err.downcast::<io::Error>()?;
++            if io_err.kind() == io::ErrorKind::NotFound {
++                eprintln!("could not connect to daemon");
++            }
++            return Err(io_err).context("connecting to daemon");
++        }
++    };
++
++    client
++        .write_connect_header(ConnectHeader::Rename(RenameRequest {
++            old_name: old_name.clone(),
++            new_name: new_name.clone(),
++        }))
++        .context("writing rename request header")?;
++
++    let reply: RenameReply = client.read_reply().context("reading reply")?;
++    let err = match reply {
++        RenameReply::Ok => return Ok(()),
++        RenameReply::NotFound => format!("not found: {old_name}"),
++        RenameReply::AlreadyExists => format!("already exists: {new_name}"),
++        RenameReply::InvalidName(msg) => msg,
++    };
++    eprintln!("{err}");
++    Err(anyhow!(err))
++}
+diff --git a/shpool-protocol/src/lib.rs b/shpool-protocol/src/lib.rs
+index 10f28264..e827f118 100644
+--- a/shpool-protocol/src/lib.rs
++++ b/shpool-protocol/src/lib.rs
+@@ -21,7 +21,7 @@ use serde_derive::{Deserialize, Serialize};
+ // We hardcode the version string to be able to track wire protocol
+ // compatibility seperately from rust API compat. For example, adding
+ // a new field is wire compatible, but not rust compatible.
+-pub const VERSION: &str = "0.4.3";
++pub const VERSION: &str = "0.4.4";
+ 
+ /// The header used to advertize daemon version.
+ ///
+@@ -70,6 +70,30 @@ pub enum ConnectHeader {
+     GetVars,
+     /// A request to modify the variable environment.
+     ModifyVar(ModifyVarRequest),
++    /// A request to give a running session a new name.
++    Rename(RenameRequest),
++}
++
++/// RenameRequest represents a request to rename the session
++/// `old_name` to `new_name`.
++#[derive(Serialize, Deserialize, Debug)]
++pub struct RenameRequest {
++    #[serde(default)]
++    pub old_name: String,
++    #[serde(default)]
++    pub new_name: String,
++}
++
++#[derive(Serialize, Deserialize, Debug, PartialEq)]
++pub enum RenameReply {
++    /// The session was renamed.
++    Ok,
++    /// There is no session named `old_name`.
++    NotFound,
++    /// There is already a session named `new_name`.
++    AlreadyExists,
++    /// `new_name` is not a valid session name.
++    InvalidName(String),
+ }
+ 
+ /// KillRequest represents a request to kill
+@@ -148,6 +172,10 @@ pub struct SessionMessageRequest {
+     /// The session to route this request to.
+     #[serde(default)]
+     pub session_name: String,
++    /// If set, route by session id rather than by name. The id never
++    /// changes, so this keeps working after the session is renamed.
++    #[serde(default)]
++    pub session_id: Option<u64>,
+     /// The actual message to send to the session.
+     #[serde(default)]
+     pub payload: SessionMessageRequestPayload,
+@@ -265,6 +293,10 @@ impl AttachHeader {
+ pub struct AttachReplyHeader {
+     #[serde(default)]
+     pub status: AttachStatus,
++    /// The id of the session that was attached to or created. Unlike the
++    /// name, it never changes for the life of the session.
++    #[serde(default)]
++    pub session_id: Option<u64>,
+ }
+ 
+ /// ListReply is contains a list of active sessions to be displayed to the user.
+@@ -279,6 +311,10 @@ pub struct ListReply {
+ pub struct Session {
+     #[serde(default)]
+     pub name: String,
++    /// A daemon-assigned id that stays the same when the session is
++    /// renamed. It is also exported into the shell as SHPOOL_SESSION_ID.
++    #[serde(default)]
++    pub id: u64,
+     #[serde(default)]
+     pub started_at_unix_ms: i64,
+     #[serde(default)]
+diff --git a/shpool/tests/attach.rs b/shpool/tests/attach.rs
+index 53ab83c0..fbe18beb 100644
+--- a/shpool/tests/attach.rs
++++ b/shpool/tests/attach.rs
+@@ -640,7 +640,9 @@ fn symlink_ssh_auth_sock() -> anyhow::Result<()> {
+ 
+     waiter.wait_event("daemon-wrote-s2c-chunk")?; // resize prompt redraw
+     attach_proc.run_cmd("ls -l $SSH_AUTH_SOCK")?;
+-    line_matcher.scan_until_re(r#".*sh1/ssh-auth-sock.socket ->.*ssh-auth-sock-target.fake$"#)?;
++    line_matcher.scan_until_re(
++        r#".*sessions/[0-9]+/ssh-auth-sock.socket ->.*ssh-auth-sock-target.fake$"#,
++    )?;
+ 
+     Ok(())
+ }
+@@ -684,7 +686,7 @@ fn symlink_ssh_auth_sock_preserved_across_forward_env_reattach() -> anyhow::Resu
+         attach_proc.run_cmd("echo prompt_cycle_1")?;
+         lm.scan_until_re("prompt_cycle_1$")?;
+         attach_proc.run_cmd("ls -l $SSH_AUTH_SOCK")?;
+-        lm.scan_until_re(r#".*sh1/ssh-auth-sock.socket ->.*ssh-auth-sock-1.fake$"#)?;
++        lm.scan_until_re(r#".*sessions/[0-9]+/ssh-auth-sock.socket ->.*ssh-auth-sock-1.fake$"#)?;
+     }
+ 
+     daemon_proc.events = Some(waiter.wait_final_event("daemon-bidi-stream-done")?);
+@@ -710,7 +712,7 @@ fn symlink_ssh_auth_sock_preserved_across_forward_env_reattach() -> anyhow::Resu
+         thread::sleep(time::Duration::from_millis(500));
+ 
+         attach_proc.run_cmd("ls -l $SSH_AUTH_SOCK")?;
+-        lm.scan_until_re(r#".*sh1/ssh-auth-sock.socket ->.*ssh-auth-sock-2.fake$"#)?;
++        lm.scan_until_re(r#".*sessions/[0-9]+/ssh-auth-sock.socket ->.*ssh-auth-sock-2.fake$"#)?;
+     }
+ 
+     daemon_proc.events = Some(bidi_done_w2.wait_final_event("daemon-bidi-stream-done")?);
+diff --git a/shpool/tests/rename.rs b/shpool/tests/rename.rs
+new file mode 100644
+index 00000000..dbbce81c
+--- /dev/null
++++ b/shpool/tests/rename.rs
+@@ -0,0 +1,240 @@
++#![allow(clippy::literal_string_with_formatting_args)]
++
++use std::time;
++
++use anyhow::Context;
++use ntest::timeout;
++
++mod support;
++
++use crate::support::daemon::{AttachArgs, DaemonArgs};
++
++/// The (name, id, status) of every session, from `shpool list --json`.
++fn sessions(daemon_proc: &mut support::daemon::Proc) -> anyhow::Result<Vec<(String, u64, String)>> {
++    let out = daemon_proc.list_json()?;
++    assert!(out.status.success(), "list --json failed");
++    let list: serde_json::Value = serde_json::from_slice(&out.stdout)?;
++    let mut sessions: Vec<_> = list["sessions"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|s| {
++            (
++                s["name"].as_str().unwrap().to_string(),
++                s["id"].as_u64().unwrap(),
++                s["status"].as_str().unwrap().to_string(),
++            )
++        })
++        .collect();
++    sessions.sort();
++    Ok(sessions)
++}
++
++#[test]
++#[timeout(30000)]
++fn detached() -> anyhow::Result<()> {
++    let mut daemon_proc = support::daemon::Proc::new("norc.toml", DaemonArgs::default())
++        .context("starting daemon proc")?;
++    let _attach_proc = daemon_proc
++        .attach("sh1", AttachArgs { background: true, ..Default::default() })
++        .context("starting attach proc")?;
++    daemon_proc.wait_until_list_matches(|out| out.contains("sh1"))?;
++    let before = sessions(&mut daemon_proc)?;
++
++    let out = daemon_proc.rename(&["sh1", "sh2"])?;
++    assert!(out.status.success(), "rename failed: {}", String::from_utf8_lossy(&out.stderr));
++    assert!(out.stdout.is_empty());
++    assert!(out.stderr.is_empty());
++
++    let after = sessions(&mut daemon_proc)?;
++    assert_eq!(after.len(), 1);
++    assert_eq!(after[0].0, "sh2");
++    // the id stays the same across the rename
++    assert_eq!(after[0].1, before[0].1);
++
++    Ok(())
++}
++
++#[test]
++#[timeout(30000)]
++fn errors() -> anyhow::Result<()> {
++    let mut daemon_proc = support::daemon::Proc::new("norc.toml", DaemonArgs::default())
++        .context("starting daemon proc")?;
++    let mut attach_procs = vec![];
++    for name in ["sh1", "sh2"] {
++        attach_procs.push(
++            daemon_proc
++                .attach(name, AttachArgs { background: true, ..Default::default() })
++                .context("starting attach proc")?,
++        );
++    }
++    daemon_proc.wait_until_list_matches(|out| out.contains("sh1") && out.contains("sh2"))?;
++
++    let out = daemon_proc.rename(&["nope", "sh3"])?;
++    assert!(!out.status.success());
++    assert!(String::from_utf8_lossy(&out.stderr).contains("not found: nope"));
++
++    let out = daemon_proc.rename(&["sh1", "sh2"])?;
++    assert!(!out.status.success());
++    assert!(String::from_utf8_lossy(&out.stderr).contains("already exists: sh2"));
++
++    for bad in ["has space", "has/slash", ".", ".."] {
++        let out = daemon_proc.rename(&["sh1", bad])?;
++        assert!(!out.status.success(), "renamed to {bad:?}");
++        assert!(String::from_utf8_lossy(&out.stderr).contains("invalid session name"));
++    }
++
++    // renaming a session to its own name is a no-op
++    let out = daemon_proc.rename(&["sh1", "sh1"])?;
++    assert!(out.status.success());
++
++    let names: Vec<_> = sessions(&mut daemon_proc)?.into_iter().map(|s| s.0).collect();
++    assert_eq!(names, vec!["sh1", "sh2"]);
++
++    Ok(())
++}
++
++// A rename shows up in an attached shell's prompt and $SHPOOL_SESSION_NAME,
++// and the attach process keeps track of its session: resizes still reach it,
++// and when the shell exits the renamed entry is removed.
++#[test]
++#[timeout(30000)]
++fn attached() -> anyhow::Result<()> {
++    let mut daemon_proc =
++        support::daemon::Proc::new("prompt_prefix_bash.toml", DaemonArgs::default())
++            .context("starting daemon proc")?;
++    let mut waiter = daemon_proc.events.take().unwrap().waiter(["daemon-wrote-s2c-chunk"]);
++
++    let mut attach_proc = daemon_proc.attach("sh1", AttachArgs::default())?;
++    let mut lm = attach_proc.line_matcher()?;
++    waiter.wait_event("daemon-wrote-s2c-chunk")?;
++    attach_proc.run_cmd("echo")?;
++    lm.scan_until_re(".*session_name=sh1 prompt>.*")?;
++
++    let out = daemon_proc.rename(&["sh1", "renamed"])?;
++    assert!(out.status.success(), "rename failed: {}", String::from_utf8_lossy(&out.stderr));
++
++    // A prompt has no trailing newline, so the next command's output ends up
++    // on the same line as the first prompt drawn after the rename.
++    attach_proc.run_cmd("echo")?;
++    attach_proc.run_cmd("echo name=$SHPOOL_SESSION_NAME")?;
++    lm.scan_until_re("session_name=renamed prompt> name=renamed$")?;
++
++    let after = sessions(&mut daemon_proc)?;
++    assert_eq!(after.len(), 1);
++    assert_eq!(after[0].0, "renamed");
++    assert_eq!(after[0].2, "Attached");
++
++    attach_proc.run_cmd("exit")?;
++    attach_proc.proc.wait()?;
++    daemon_proc.wait_until_list_matches(|out| !out.contains("renamed"))?;
++
++    Ok(())
++}
++
++// After a rename, a new session can take the old name, and the two
++// don't share a session directory.
++#[test]
++#[timeout(30000)]
++fn reuse_old_name() -> anyhow::Result<()> {
++    let mut daemon_proc = support::daemon::Proc::new("norc.toml", DaemonArgs::default())
++        .context("starting daemon proc")?;
++
++    let mut first = daemon_proc.attach("sh1", AttachArgs::default())?;
++    let mut first_lm = first.line_matcher()?;
++    first.run_cmd("echo dir=$SHPOOL_SESSION_DIR")?;
++    let first_dir = first_lm.scan_until_re_captures("dir=(.*)$")?[1].clone().unwrap();
++
++    let out = daemon_proc.rename(&["sh1", "sh2"])?;
++    assert!(out.status.success(), "rename failed: {}", String::from_utf8_lossy(&out.stderr));
++
++    let mut second = daemon_proc.attach("sh1", AttachArgs::default())?;
++    let mut second_lm = second.line_matcher()?;
++    second.run_cmd("echo dir=$SHPOOL_SESSION_DIR")?;
++    let second_dir = second_lm.scan_until_re_captures("dir=(.*)$")?[1].clone().unwrap();
++    assert_ne!(first_dir, second_dir);
++
++    let names: Vec<_> = sessions(&mut daemon_proc)?.into_iter().map(|s| (s.0, s.2)).collect();
++    assert_eq!(
++        names,
++        vec![
++            (String::from("sh1"), String::from("Attached")),
++            (String::from("sh2"), String::from("Attached")),
++        ]
++    );
++
++    // Exiting the renamed shell removes it, not the new sh1.
++    first.run_cmd("exit")?;
++    first.proc.wait()?;
++    daemon_proc.wait_until_list_matches(|out| !out.contains("sh2"))?;
++    let names: Vec<_> = sessions(&mut daemon_proc)?.into_iter().map(|s| s.0).collect();
++    assert_eq!(names, vec!["sh1"]);
++
++    Ok(())
++}
++
++// From inside a session, `shpool rename NEW` renames the current session,
++// and `shpool detach` finds the session by its id even though
++// $SHPOOL_SESSION_NAME is stale until the next prompt.
++#[test]
++#[timeout(30000)]
++fn current_session() -> anyhow::Result<()> {
++    let mut daemon_proc = support::daemon::Proc::new("norc.toml", DaemonArgs::default())
++        .context("starting daemon proc")?;
++    let mut waiter = daemon_proc
++        .events
++        .take()
++        .unwrap()
++        .waiter(["daemon-bidi-stream-enter", "daemon-bidi-stream-done"]);
++
++    let mut attach_proc = daemon_proc.attach("sh1", AttachArgs::default())?;
++    waiter.wait_event("daemon-bidi-stream-enter")?;
++
++    let bin = support::shpool_bin()?;
++    let socket = daemon_proc.socket_path.clone();
++    attach_proc.run_cmd(&format!(
++        "'{bin}' --socket '{socket}' rename inner && '{bin}' --socket '{socket}' detach",
++        bin = bin.display(),
++        socket = socket.display(),
++    ))?;
++
++    daemon_proc.events = Some(waiter.wait_final_event("daemon-bidi-stream-done")?);
++    assert!(attach_proc.proc.wait()?.success());
++
++    let names: Vec<_> = sessions(&mut daemon_proc)?.into_iter().map(|s| (s.0, s.2)).collect();
++    assert_eq!(names, vec![(String::from("inner"), String::from("Disconnected"))]);
++
++    Ok(())
++}
++
++// The ttl reaper keeps track of a session across a rename, and does not
++// reap a new session that takes the old name.
++#[test]
++#[timeout(30000)]
++fn ttl() -> anyhow::Result<()> {
++    let mut daemon_proc = support::daemon::Proc::new("norc.toml", DaemonArgs::default())
++        .context("starting daemon proc")?;
++    let mut attach_proc = daemon_proc
++        // Long enough that the rename below lands before the reaper fires,
++        // even on a slow CI runner.
++        .attach("sh1", AttachArgs { ttl: Some(time::Duration::from_secs(3)), ..Default::default() })
++        .context("starting attach proc")?;
++    let mut lm = attach_proc.line_matcher()?;
++    attach_proc.run_cmd("echo hi")?;
++    lm.scan_until_re("hi$")?;
++
++    let out = daemon_proc.rename(&["sh1", "sh2"])?;
++    assert!(out.status.success(), "rename failed: {}", String::from_utf8_lossy(&out.stderr));
++    let _new_sh1 = daemon_proc
++        .attach("sh1", AttachArgs { background: true, ..Default::default() })
++        .context("starting attach proc")?;
++    daemon_proc.wait_until_list_matches(|out| out.contains("sh1"))?;
++
++    // wait for the reaper to clobber the renamed session
++    daemon_proc.wait_until_list_matches(|out| !out.contains("sh2"))?;
++
++    let names: Vec<_> = sessions(&mut daemon_proc)?.into_iter().map(|s| s.0).collect();
++    assert_eq!(names, vec!["sh1"]);
++
++    Ok(())
++}
+diff --git a/shpool/tests/support/daemon.rs b/shpool/tests/support/daemon.rs
+index c2715409..69e0711b 100644
+--- a/shpool/tests/support/daemon.rs
++++ b/shpool/tests/support/daemon.rs
+@@ -424,6 +424,25 @@ impl Proc {
+         cmd.output().context("spawning kill proc")
+     }
+ 
++    pub fn rename(&mut self, names: &[&str]) -> anyhow::Result<process::Output> {
++        let log_file = self.tmp_dir.path().join(format!("rename_{}.log", self.subproc_counter));
++        eprintln!("spawning rename proc with log {:?}", log_file);
++        self.subproc_counter += 1;
++
++        let mut cmd = Command::new(&self.bin_path);
++        cmd.arg("-vv")
++            .arg("--log-file")
++            .arg(&log_file)
++            .arg("--socket")
++            .arg(&self.socket_path)
++            .arg("rename");
++        for name in names.iter() {
++            cmd.arg(name);
++        }
++
++        cmd.output().context("spawning rename proc")
++    }
++
+     pub fn wait_until_list_matches<F>(&mut self, pred: F) -> anyhow::Result<()>
+     where
+         F: Fn(&str) -> bool,

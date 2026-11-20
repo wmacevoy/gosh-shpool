@@ -1,0 +1,36 @@
+# Copyright 2026 Warren D. MacEvoy. Apache-2.0. See LICENSE.
+#
+# The check (tools/check.sh): shpool at its pin with the seam applied, built, and shpool's own
+# tests run on it, the seam's included. On Linux and macOS, as shpool's own presubmit does, with
+# the shells its prompt tests need.
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: The shells shpool's tests use (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q zsh fish
+      - name: The shells shpool's tests use (macOS)
+        if: runner.os == 'macOS'
+        run: brew install fish
+      - name: Build and run shpool's tests, the seam's included
+        run: SHPOOL_LEAVE_TEST_LOGS=true tools/check.sh --no-fail-fast
+      - name: The test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: /tmp/shpool-test/**/*.log
+          retention-days: 14

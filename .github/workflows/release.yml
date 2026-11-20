@@ -1,0 +1,141 @@
+# Copyright 2026 Warren D. MacEvoy. Apache-2.0. See LICENSE.
+#
+# Builds what a release of gosh-shpool consists of, for the same machines as a gosh release, and
+# on a tag vVERSION (v0.11.7-gosh.1: shpool's release, then ours) publishes it as a GitHub
+# pre-release:
+#
+#   gosh-shpool-VERSION-linux-x86_64.tar.gz      needing only the C library, built on Ubuntu 22.04
+#   gosh-shpool-VERSION-linux-aarch64.tar.gz       so that it runs on anything newer
+#   gosh-shpool-VERSION-linux-x86_64-musl.tar.gz   needing nothing: Rust's musl target, linked
+#   gosh-shpool-VERSION-linux-aarch64-musl.tar.gz    statically (for Alpine and the like)
+#   gosh-shpool-VERSION-macos-universal.tar.gz   Apple Silicon and Intel in one, if it builds
+#   SHA256SUMS                                   of each of these
+#
+# It publishes nothing unless ci.yml passed on the same commit, and refuses a glibc build that
+# needs a glibc newer than 2.34, the promise gosh's releases make. Started by hand it builds
+# everything and publishes nothing: a rehearsal.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, runner: ubuntu-22.04, target: "" }
+          - { platform: linux-aarch64, runner: ubuntu-22.04-arm, target: "" }
+          - { platform: linux-x86_64-musl, runner: ubuntu-22.04, target: x86_64-unknown-linux-musl }
+          - { platform: linux-aarch64-musl, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0 # (package-release.sh names shpool's release by its tag)
+      - name: Build
+        run: SHPOOL_TARGET="${{ matrix.target }}" tools/build.sh
+      - name: Strip, and see that it runs
+        run: |
+          strip .build/bin/shpool
+          file .build/bin/shpool
+          .build/bin/shpool version
+          .build/bin/shpool help rename >/dev/null
+      - name: What it needs from the system (glibc builds refused above 2.34; musl builds need nothing)
+        run: |
+          program=.build/bin/shpool
+          if [ -n "${{ matrix.target }}" ]; then
+            if file "$program" | grep -q 'dynamically linked'; then
+              echo "::error::the musl build of shpool is not statically linked"
+              exit 1
+            fi
+            echo "statically linked"
+          else
+            newest=$(objdump -T "$program" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -n 1)
+            echo "$program needs up to $newest"
+            if [ "$(printf '%s\n%s\n' "$newest" GLIBC_2.34 | sort -V | tail -n 1)" != GLIBC_2.34 ]; then
+              echo "::error::$program needs $newest, newer than the glibc 2.34 gosh's releases promise"
+              exit 1
+            fi
+          fi
+      - name: Package
+        run: tools/package-release.sh "${GITHUB_REF_NAME#v}" "${{ matrix.platform }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/
+
+  # One build for Apple Silicon and Intel, as gosh's: the two halves joined, signed ad hoc (Apple
+  # Silicon runs nothing unsigned). Allowed to fail, as gosh's is: a release goes out without it.
+  macos:
+    runs-on: macos-latest
+    continue-on-error: true
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Build both halves and join them
+        run: |
+          SHPOOL_TARGET=aarch64-apple-darwin tools/build.sh
+          cp .build/bin/shpool shpool-arm64
+          SHPOOL_TARGET=x86_64-apple-darwin tools/build.sh
+          lipo -create -output .build/bin/shpool shpool-arm64 .build/bin/shpool
+          strip -x .build/bin/shpool
+          codesign --force --sign - .build/bin/shpool
+          lipo -info .build/bin/shpool
+          .build/bin/shpool version
+      - name: Package
+        run: tools/package-release.sh "${GITHUB_REF_NAME#v}" macos-universal dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/
+
+  publish:
+    if: always() && github.ref_type == 'tag' && needs.linux.result == 'success'
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      # A release is only of a commit whose check passed: ci.yml's run on this commit, waited
+      # for if it is still going (up to 90 minutes).
+      - name: The check passed on this commit (ci.yml)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 180); do
+            state=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --limit 1 --json status,conclusion \
+                    --jq '.[0] | "\(.status) \(.conclusion)"' 2>/dev/null || true)
+            case "$state" in
+              "completed success") echo "ci.yml passed on $GITHUB_SHA"; exit 0 ;;
+              completed*) echo "::error::ci.yml did not pass on $GITHUB_SHA ($state): nothing is published"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "::error::no finished ci.yml run on $GITHUB_SHA: nothing is published"
+          exit 1
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum gosh-shpool-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish as a pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ls dist/*macos-universal* >/dev/null 2>&1; then macos="macOS: built for Apple Silicon and Intel."
+          else macos="macOS: did not build; not in this release."; fi
+          gh release create "$GITHUB_REF_NAME" dist/* --prerelease --title "gosh-shpool ${GITHUB_REF_NAME#v}" \
+            --notes "shpool with gosh-shpool's seam (seam/README.md). Not independently reviewed. $macos"
