@@ -1,3 +1,6 @@
 [submodule "core"]
 	path = core
 	url = https://github.com/shell-pool/shpool.git
+[submodule "vt100"]
+	path = vt100
+	url = https://github.com/shell-pool/shpool_vt100.git

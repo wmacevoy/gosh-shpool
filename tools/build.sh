@@ -2,7 +2,8 @@
 # Copyright 2026 Warren D. MacEvoy. Apache-2.0. See LICENSE.
 # Builds gosh-shpool in .build/: a copy of shpool at its pinned release (core/), with the
 # seam's patches applied in the order of their names, built there, and the program put at
-# .build/bin/shpool.
+# .build/bin/shpool. Beside it, a copy of shpool_vt100 (vt100/) with seam/vt100's patches,
+# which the core's seam points shpool at instead of crates.io's (seam/03).
 #
 # A copy, so that core/ stays upstream's byte for byte. A patch that does not apply exactly
 # stops the build: that is how a moved pin says what the seam costs (seam/README.md).
@@ -12,18 +13,26 @@
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD="$ROOT/.build"
-[ -f "$ROOT/core/Cargo.toml" ] || { echo "build: core/ is empty: git submodule update --init"; exit 1; }
-rm -rf "$BUILD/core" "$BUILD/bin" && mkdir -p "$BUILD/core" "$BUILD/bin"
-(cd "$ROOT/core" && git ls-files -z | tar --null -T - -cf - | tar -xf - -C "$BUILD/core")
-cd "$BUILD/core"
-applied=0
-for patch in "$ROOT"/seam/*.patch; do
-    [ -f "$patch" ] || continue
-    patch -p1 --fuzz=0 --no-backup-if-mismatch -s < "$patch" \
-        || { echo "build: the seam's $(basename "$patch") does not apply to the core"; exit 1; }
-    applied=$((applied + 1))
+for part in core vt100; do
+    [ -f "$ROOT/$part/Cargo.toml" ] || { echo "build: $part/ is empty: git submodule update --init"; exit 1; }
 done
-echo "build: $applied of the seam's patches applied"
+rm -rf "$BUILD/core" "$BUILD/vt100" "$BUILD/bin" && mkdir -p "$BUILD/core" "$BUILD/vt100" "$BUILD/bin"
+
+# copy PART SEAM_DIR: copies the submodule PART to .build/PART and applies SEAM_DIR/*.patch
+copy() {
+    (cd "$ROOT/$1" && git ls-files -z | tar --null -T - -cf - | tar -xf - -C "$BUILD/$1")
+    applied=0
+    for patch in "$2"/*.patch; do
+        [ -f "$patch" ] || continue
+        (cd "$BUILD/$1" && patch -p1 --fuzz=0 --no-backup-if-mismatch -s < "$patch") \
+            || { echo "build: $(basename "$patch") does not apply to $1"; exit 1; }
+        applied=$((applied + 1))
+    done
+    echo "build: $applied of the seam's patches applied to $1"
+}
+copy vt100 "$ROOT/seam/vt100"
+copy core "$ROOT/seam"
+cd "$BUILD/core"
 
 # The Rust the core pins (its rust-toolchain.toml), where rustup can provide it; without
 # rustup, whatever cargo is on the PATH (pixi's, locally).

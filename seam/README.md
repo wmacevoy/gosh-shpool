@@ -1,7 +1,9 @@
 # The seam
 
 What gosh-shpool changes in shpool. `core/` is upstream's shpool at its pinned release and is
-never edited. `tools/build.sh` copies it to `.build/core` and applies every `*.patch` here to
+never edited, and so is `vt100/`, upstream's shpool_vt100 (shpool's terminal emulator) at the
+release shpool uses. `seam/vt100/*.patch` apply to a copy of `vt100/` the same way, and
+`03-vt100-seam.patch` points shpool at that copy instead of crates.io's. `tools/build.sh` copies it to `.build/core` and applies every `*.patch` here to
 the copy, in the order of their names. A patch that does not apply exactly (`--fuzz=0`) stops
 the build.
 
@@ -12,7 +14,9 @@ seam: every patch here is also offered to shpool, and goes once a shpool release
 | Patch | Upstream |
 | --- | --- |
 | `01-rename.patch` | [shell-pool/shpool#459](https://github.com/shell-pool/shpool/pull/459) |
-| `02-macos-tests.patch` | not yet offered (tests only: find zsh/fish, unskip the motd pager tests) |
+| `02-macos-tests.patch` | not yet offered (tests only: find zsh/fish, unskip tests that pass on macOS) |
+| `03-vt100-seam.patch` | becomes a version bump once shpool_vt100 releases the fix |
+| `vt100/01-last-n-rows.patch` | not yet offered to [shell-pool/shpool_vt100](https://github.com/shell-pool/shpool_vt100) |
 
 To change one: edit the copy in `.build/core`, see it build and `tools/check.sh` pass, and cut
 the patch again from the difference (`git diff` in a checkout of `core/` with the earlier patches

@@ -1,0 +1,103 @@
+Copyright 2026 Warren D. MacEvoy. Apache-2.0. See LICENSE.
+
+What:   builds shpool against gosh-shpool's shpool_vt100 (vt100/ with seam/vt100 applied, built
+        at .build/vt100) instead of the one on crates.io, for its line-mode restore fix. Tests:
+        lines_restore_ends_with_the_prompt shows the fix on Linux (it fails with shpool_vt100
+        as published); lines_restore only passed because of the bug (it ran a command after
+        "echo foo", so "foo" was not in the last 2 lines) and now runs just "echo foo";
+        dynamic_session_restore_mode, which caught the bug on macOS, is no longer skipped there.
+Where:  Cargo.toml ([patch.crates-io]), Cargo.lock (shpool_vt100 from a path), shpool/tests/attach.rs.
+Shape:  changes a dependency's source; shpool's own code is unchanged.
+Needs:  02-macos-tests.patch before it, and tools/build.sh to have built .build/vt100.
+Status: upstream, once shpool_vt100 releases the fix: a version bump in shpool instead of the
+        [patch.crates-io], with these tests.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 1a7ae814..d6afae95 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1052,8 +1052,6 @@ dependencies = [
+ [[package]]
+ name = "shpool_vt100"
+ version = "0.1.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e839aaacba63b9c8fba16affed9507042eb33d802cf8040c4a6f37e3945029c3"
+ dependencies = [
+  "itoa",
+  "log",
+diff --git a/Cargo.toml b/Cargo.toml
+index 55d10b3b..48e31d3e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -6,3 +6,7 @@ members = [
+     "shpool",
+     "shpool-protocol",
+ ]
++
++# gosh-shpool: shpool_vt100 with gosh-shpool's seam (seam/vt100), built beside the core.
++[patch.crates-io]
++shpool_vt100 = { path = "../vt100" }
+diff --git a/shpool/tests/attach.rs b/shpool/tests/attach.rs
+index 087d205a..a28a04a2 100644
+--- a/shpool/tests/attach.rs
++++ b/shpool/tests/attach.rs
+@@ -1517,8 +1517,9 @@ fn lines_restore() -> anyhow::Result<()> {
+             daemon_proc.attach("sh1", Default::default()).context("starting attach proc")?;
+         let mut line_matcher = attach_proc.line_matcher()?;
+ 
++        // (just this: with another command after it, "foo" would no
++        // longer be in the last 2 lines)
+         attach_proc.run_cmd("echo foo")?;
+-        attach_proc.run_cmd("echo")?;
+         line_matcher.scan_until_re("foo$")?;
+     }
+ 
+@@ -1539,6 +1540,40 @@ fn lines_restore() -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++// With more output than the restore asks for, the restore is the last lines
++// up to and including the prompt the cursor is on, with the cursor left on
++// that prompt: not the lines above the prompt, with the cursor below them.
++#[test]
++#[timeout(30000)]
++fn lines_restore_ends_with_the_prompt() -> anyhow::Result<()> {
++    let mut daemon_proc = support::daemon::Proc::new("restore_lines.toml", DaemonArgs::default())
++        .context("starting daemon proc")?;
++    let bidi_done_w = daemon_proc.events.take().unwrap().waiter(["daemon-bidi-stream-done"]);
++
++    {
++        let mut attach_proc =
++            daemon_proc.attach("sh1", Default::default()).context("starting attach proc")?;
++        let mut line_matcher = attach_proc.line_matcher()?;
++        for word in ["one", "two", "three"] {
++            attach_proc.run_cmd(&format!("echo {word}"))?;
++            line_matcher.scan_until_re(&format!("{word}$"))?;
++        }
++    }
++    daemon_proc.events = Some(bidi_done_w.wait_final_event("daemon-bidi-stream-done")?);
++
++    {
++        let mut attach_proc =
++            daemon_proc.attach("sh1", Default::default()).context("starting attach proc")?;
++        let mut line_matcher = attach_proc.line_matcher()?;
++        // The two lines are "prompt> three" and the prompt, so "three" ends
++        // a line. Restoring the two lines above the prompt instead leaves
++        // "three" followed by a cursor movement, and shows "two".
++        line_matcher.scan_until_re("prompt> three$")?;
++    }
++
++    Ok(())
++}
++
+ // The restore buffer has to carry the input modes the application turned on,
+ // not just the screen contents. A terminal that attaches without them silently
+ // loses bracketed paste, application cursor/keypad and mouse reporting.
+@@ -2275,7 +2310,6 @@ fn up_arrow_no_crash() -> anyhow::Result<()> {
+ 
+ #[test]
+ #[timeout(30000)]
+-#[cfg_attr(target_os = "macos", ignore)]
+ fn dynamic_session_restore_mode() -> anyhow::Result<()> {
+     let tmp_dir = tmpdir::Dir::new("/tmp/shpool-test")?;
+     let config_tmpl = fs::read_to_string(support::testdata_file("dynamic_restore.toml.tmpl"))?;

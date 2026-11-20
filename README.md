@@ -5,6 +5,8 @@ small seam of patches, built for the same machines as a gosh release. remote-gos
 hosts that have no shpool, for its persistent terminals.
 
 - `core/` is upstream shpool at its pinned release (now `v0.11.7`), a submodule, never edited.
+- `vt100/` is upstream [shpool_vt100](https://github.com/shell-pool/shpool_vt100), shpool's
+  terminal emulator, at the release shpool uses (`0.1.3`), also never edited.
 - `seam/` is what gosh-shpool changes, one patch per change, each also offered upstream
   ([seam/README.md](seam/README.md)). The aim is an empty seam.
 - `tools/build.sh` copies the core to `.build/core`, applies the seam exactly (`--fuzz=0`), and
@@ -16,6 +18,10 @@ hosts that have no shpool, for its persistent terminals.
 `shpool rename [OLD_NAME] NEW_NAME`, and `SHPOOL_SESSION_ID`, an id for each session that never
 changes (also in `shpool list --json`). Offered upstream as
 [shell-pool/shpool#459](https://github.com/shell-pool/shpool/pull/459).
+
+It also fixes line-mode session restore (`session_restore_mode = { lines = N }`): on reattach
+the last N lines are redrawn up to and including the prompt, with the cursor on it
+(`seam/vt100/01-last-n-rows.patch`).
 
 ## Releases
 

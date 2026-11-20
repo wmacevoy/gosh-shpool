@@ -16,7 +16,7 @@ cp "$ROOT/.build/bin/shpool" "$stage/$name/shpool"
 chmod 755 "$stage/$name/shpool"
 cp "$ROOT/core/LICENSE" "$stage/$name/LICENSE"
 upstream=$(cd "$ROOT/core" && git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)
-patches=$(cd "$ROOT/seam" && ls ./*.patch 2>/dev/null | sed 's|^\./||' | tr '\n' ' ')
+patches=$(cd "$ROOT/seam" && ls ./*.patch ./vt100/*.patch 2>/dev/null | sed 's|^\./||' | tr '\n' ' ')
 cat > "$stage/$name/README.md" <<NOTE
 gosh-shpool $VERSION for $PLATFORM.
 
